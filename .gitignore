@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# App runtime files
+.webai.log
+.webai.pid
+.saved_prefs.json
+.saved_sites.json
+
+# Claude
+.claude/
+
+# Outputs
+outputs/

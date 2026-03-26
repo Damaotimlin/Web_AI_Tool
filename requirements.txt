@@ -1,0 +1,6 @@
+gradio>=4.0.0
+python-pptx>=0.6.21
+requests>=2.31.0
+lxml>=4.9.0
+beautifulsoup4>=4.12.0
+browser_cookie3>=0.20.0
