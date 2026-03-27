@@ -22,6 +22,7 @@ PREFERRED_MODELS = [
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 SAVED_SITES_FILE = os.path.join(os.path.dirname(__file__), ".saved_sites.json")
+SITES_HISTORY_FILE = os.path.join(os.path.dirname(__file__), ".sites_history.json")
 SAVED_PREFS_FILE = os.path.join(os.path.dirname(__file__), ".saved_prefs.json")
 
 DEFAULT_PREFS = {
@@ -43,6 +44,28 @@ def load_saved_sites() -> list[str]:
         return []
 
 
+def load_sites_history() -> list[str]:
+    """Load all ever-used site URLs (history for dropdown choices)."""
+    try:
+        with open(SITES_HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_sites_history(sites: list[str]):
+    """Add sites to history (never removes, only appends new ones)."""
+    history = load_sites_history()
+    existing = set(history)
+    for s in sites:
+        s = s.strip()
+        if s and s not in existing:
+            history.append(s)
+            existing.add(s)
+    with open(SITES_HISTORY_FILE, "w") as f:
+        json.dump(history, f)
+
+
 def load_saved_prefs() -> dict:
     """Load saved user preferences from disk."""
     try:
@@ -62,8 +85,7 @@ def save_prefs(**kwargs):
 
 
 def save_sites(sites: list[str]):
-    """Save site URLs to disk."""
-    # Deduplicate while preserving order
+    """Save active site URLs to disk, and add to history."""
     seen = set()
     unique = []
     for s in sites:
@@ -73,6 +95,8 @@ def save_sites(sites: list[str]):
             unique.append(s)
     with open(SAVED_SITES_FILE, "w") as f:
         json.dump(unique, f)
+    # Also add to permanent history
+    save_sites_history(unique)
 
 
 def get_available_models() -> list[str]:
@@ -164,6 +188,78 @@ def html_to_text(html: str) -> str:
     return article.get_text(separator="\n", strip=True) if article else soup.get_text(separator="\n", strip=True)
 
 
+def extract_images_from_html(html: str, base_url: str = "", max_images: int = 10) -> list[str]:
+    """Extract article images from HTML — OG image, meta images, and large article images."""
+    soup = BeautifulSoup(html, "lxml")
+    images = []
+    seen = set()
+
+    # 1. Open Graph image (highest quality, most relevant)
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        images.append(og["content"])
+        seen.add(og["content"])
+
+    # 2. Twitter card image
+    tw = soup.find("meta", attrs={"name": "twitter:image"})
+    if tw and tw.get("content") and tw["content"] not in seen:
+        images.append(tw["content"])
+        seen.add(tw["content"])
+
+    # 3. Large images from article body
+    article = soup.find("article") or soup.find("main") or soup.find("body")
+    if article:
+        for img in article.find_all("img", src=True):
+            src = img["src"]
+            if src.startswith("data:"):
+                continue
+            src = urljoin(base_url, src) if base_url else src
+            # Skip tiny icons/tracking pixels
+            w = img.get("width", "")
+            h = img.get("height", "")
+            if w and str(w).isdigit() and int(w) < 100:
+                continue
+            if h and str(h).isdigit() and int(h) < 100:
+                continue
+            if src not in seen:
+                images.append(src)
+                seen.add(src)
+            if len(images) >= max_images:
+                break
+
+    return images
+
+
+IMG_CACHE_DIR = os.path.join(os.path.dirname(__file__), "outputs", ".img_cache")
+os.makedirs(IMG_CACHE_DIR, exist_ok=True)
+
+
+def download_image(url: str) -> str | None:
+    """Download an image and return the local path, or None on failure."""
+    try:
+        res = requests.get(url, headers={"User-Agent": BROWSER_UA}, timeout=15, stream=True)
+        res.raise_for_status()
+        content_type = res.headers.get("Content-Type", "")
+        if "image" not in content_type and not url.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+            return None
+        # Determine extension
+        ext = ".jpg"
+        if "png" in content_type or url.lower().endswith(".png"):
+            ext = ".png"
+        elif "webp" in content_type or url.lower().endswith(".webp"):
+            ext = ".webp"
+        import hashlib
+        fname = hashlib.md5(url.encode()).hexdigest() + ext
+        path = os.path.join(IMG_CACHE_DIR, fname)
+        if not os.path.exists(path):
+            with open(path, "wb") as f:
+                for chunk in res.iter_content(8192):
+                    f.write(chunk)
+        return path
+    except Exception:
+        return None
+
+
 def normalize_url(url: str) -> str:
     """Ensure URL has a scheme."""
     url = url.strip()
@@ -172,20 +268,78 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def fetch_url(url: str, session: requests.Session | None = None) -> str:
-    url = normalize_url(url)
-    """Fetch page content. Uses session cookies if available, otherwise Jina Reader."""
+def resolve_google_news_url(url: str) -> str:
+    """Resolve Google News redirect URLs to actual article URLs."""
+    if "news.google.com/rss/articles/" not in url:
+        return url
     try:
-        if session and session.cookies:
+        res = requests.head(url, allow_redirects=True, timeout=10, headers={"User-Agent": BROWSER_UA})
+        if res.url and "news.google.com" not in res.url:
+            return res.url
+        # Sometimes HEAD doesn't resolve, try GET
+        res = requests.get(url, allow_redirects=True, timeout=10, headers={"User-Agent": BROWSER_UA})
+        return res.url if res.url else url
+    except Exception:
+        return url
+
+
+def fetch_url(url: str, session: requests.Session | None = None) -> str:
+    """Fetch page content. Tries: 1) direct with session, 2) direct without, 3) Jina Reader."""
+    url = normalize_url(url)
+    url = resolve_google_news_url(url)
+
+    # Try 1: direct fetch with session cookies
+    if session and session.cookies:
+        try:
             res = session.get(url, timeout=30)
             res.raise_for_status()
-            return html_to_text(res.text)
-        else:
-            res = requests.get(f"https://r.jina.ai/{url}", timeout=30)
-            res.raise_for_status()
-            return res.text
-    except Exception as e:
-        raise ValueError(f"Failed to fetch URL: {e}")
+            text = html_to_text(res.text)
+            if len(text) > 200:
+                return text
+        except Exception:
+            pass
+
+    # Try 2: direct fetch without cookies (build fresh session for this domain)
+    try:
+        s = build_session_for_url(url)
+        res = s.get(url, timeout=30)
+        res.raise_for_status()
+        text = html_to_text(res.text)
+        if len(text) > 200:
+            return text
+    except Exception:
+        pass
+
+    # Try 3: Jina Reader as last resort
+    try:
+        res = requests.get(f"https://r.jina.ai/{url}", timeout=30)
+        res.raise_for_status()
+        return res.text
+    except Exception:
+        pass
+
+    raise ValueError(f"All fetch methods failed for {url}")
+
+
+def fetch_article_images(url: str, session: requests.Session | None = None, max_images: int = 3) -> list[str]:
+    """Fetch and download article images. Returns list of local file paths."""
+    url = normalize_url(url)
+    url = resolve_google_news_url(url)
+    try:
+        s = session or build_session_for_url(url)
+        res = s.get(url, timeout=15)
+        res.raise_for_status()
+        image_urls = extract_images_from_html(res.text, url, max_images=max_images)
+        local_paths = []
+        for img_url in image_urls:
+            path = download_image(img_url)
+            if path:
+                local_paths.append(path)
+            if len(local_paths) >= max_images:
+                break
+        return local_paths
+    except Exception:
+        return []
 
 
 def chat(prompt: str, model: str = "") -> str:
@@ -196,7 +350,7 @@ def chat(prompt: str, model: str = "") -> str:
         "temperature": 0.3,
     }
     try:
-        res = requests.post(LM_STUDIO_URL, json=payload, timeout=120)
+        res = requests.post(LM_STUDIO_URL, json=payload, timeout=300)
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
     except Exception as e:
@@ -212,11 +366,12 @@ The user's original research prompt was: "{user_prompt}"
 Consider this context when summarizing — focus on aspects most relevant to the user's interest.
 """
     prompt = f"""
-Translate and summarize the following content into {language}.
-Return a clean, concise summary (max 300 words).
+Translate and provide a comprehensive summary of the following content into {language}.
+The summary should be detailed and thorough (500-800 words). Cover all key points, data, quotes, and analysis.
+Do NOT be brief — include specific numbers, names, dates, and details from the article(s).
 {user_instruction}
 Content:
-{content[:5000]}
+{content[:12000]}
 """
     return chat(prompt, model)
 
@@ -233,8 +388,8 @@ def _slide_json_template(lang1: str, lang2: str = "") -> str:
     {{
       "heading_primary": "Heading in {lang1}",
       "heading_secondary": "Heading in {lang2}",
-      "bullets_primary": ["Point 1 in {lang1}", "Point 2 in {lang1}"],
-      "bullets_secondary": ["Point 1 in {lang2}", "Point 2 in {lang2}"]
+      "bullets_primary": ["Detailed point with specifics in {lang1}", "Another detailed point with data/numbers in {lang1}", "Third point with analysis in {lang1}", "Fourth point with context in {lang1}", "Fifth point with implications in {lang1}"],
+      "bullets_secondary": ["Same point in {lang2}", "Same point in {lang2}", "Same point in {lang2}", "Same point in {lang2}", "Same point in {lang2}"]
     }}
   ]
 }}"""
@@ -245,7 +400,7 @@ def _slide_json_template(lang1: str, lang2: str = "") -> str:
   "slides": [
     {{
       "heading_primary": "Heading in {lang1}",
-      "bullets_primary": ["Point 1 in {lang1}", "Point 2 in {lang1}"]
+      "bullets_primary": ["Detailed point with specifics in {lang1}", "Another detailed point with data/numbers in {lang1}", "Third point with analysis in {lang1}", "Fourth point with context in {lang1}", "Fifth point with implications in {lang1}"]
     }}
   ]
 }}"""
@@ -269,9 +424,19 @@ If the prompt contains specific requests about how to present or summarize, foll
 Create a keynote presentation structure with exactly {num_slides} content slides.
 {lang_instruction}
 {user_instruction}
+IMPORTANT rules for content quality:
+- Each slide MUST have 4-6 detailed bullet points
+- Each bullet should be a full sentence (15-30 words), not just a short phrase
+- Include specific data: numbers, percentages, dollar amounts, dates, company names
+- Cover different angles: facts, analysis, market impact, expert quotes, future outlook
+- Spread the content across all {num_slides} slides — do NOT front-load everything into the first few slides
+- Each slide should have a distinct sub-topic or angle
+- If multiple articles are provided (separated by ---), SYNTHESIZE the information from ALL sources, do NOT just repeat one article
+- Combine complementary details from different sources to build a comprehensive picture
+
 Based on this content:
 
-{content[:5000]}
+{content[:15000]}
 
 Respond ONLY with valid JSON in this exact format, no markdown, no extra text:
 {_slide_json_template(language, lang2)}
@@ -320,7 +485,7 @@ def add_hyperlink(paragraph, url, text, font_size, color, slide_part=None):
     r_elem.append(hlinkClick)
 
 
-def build_pptx(data: dict, theme: str, issues: list[str] | None = None) -> str:
+def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_image: str | None = None) -> str:
     """Build .pptx file from slide data — dual-language with source links."""
     themes = {
         "Dark":  {"bg": RGBColor(0x1A, 0x1A, 0x2E), "title": RGBColor(0xE9, 0x4F, 0x37), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xAA, 0xAA), "link": RGBColor(0x4F, 0xC3, 0xF7)},
@@ -334,7 +499,7 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None) -> str:
     prs.slide_height = Inches(7.5)
 
     source_url = data.get("source_url", "")
-    source_title = data.get("source_title", "")
+    all_sources = data.get("all_sources", [source_url] if source_url else [])
 
     def set_bg(slide, color):
         bg = slide.background
@@ -382,15 +547,100 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None) -> str:
         sp2.font.size = Pt(18)
         sp2.font.color.rgb = colors["sub"]
 
-    # Source link on title slide
-    if source_url:
-        srcBox = title_slide.shapes.add_textbox(Inches(1.5), Inches(5.8), Inches(10), Inches(0.5))
+    # Cover image on title slide (lower right, below text)
+    if cover_image and os.path.exists(cover_image):
+        try:
+            from PIL import Image
+            with Image.open(cover_image) as img:
+                img_w, img_h = img.size
+            aspect = img_w / img_h if img_h else 1
+            max_w, max_h = 3.5, 2.5
+            if aspect > max_w / max_h:
+                w = min(max_w, img_w / 96)
+                h = w / aspect
+            else:
+                h = min(max_h, img_h / 96)
+                w = h * aspect
+            # Position: bottom-right corner with padding
+            left = Inches(13.33 - w - 0.6)
+            top = Inches(7.5 - h - 0.6)
+            title_slide.shapes.add_picture(cover_image, left, top, Inches(w), Inches(h))
+        except ImportError:
+            title_slide.shapes.add_picture(cover_image, Inches(9.0), Inches(4.5), Inches(3.5), Inches(2.2))
+        except Exception:
+            pass
+
+    # Source links on title slide
+    if all_sources:
+        src_y = 5.2 if len(all_sources) > 1 else 5.8
+        srcBox = title_slide.shapes.add_textbox(Inches(1.5), Inches(src_y), Inches(8), Inches(1.8))
         srctf = srcBox.text_frame
-        srcp = srctf.paragraphs[0]
-        add_hyperlink(srcp, source_url, f"Source: {source_title[:80]}", Pt(12), colors["link"], slide_part=title_slide.part)
+        srctf.word_wrap = True
+        for si, src_url in enumerate(all_sources):
+            src_domain = urlparse(normalize_url(src_url)).netloc
+            sp = srctf.paragraphs[0] if si == 0 else srctf.add_paragraph()
+            add_hyperlink(sp, src_url, f"📎 {src_domain}", Pt(11), colors["link"], slide_part=title_slide.part)
+            sp.space_after = Pt(2)
+
+    # --- Summary Slide ---
+    summary_text = data.get("summary", "")
+    if summary_text:
+        # Split into lines first, then paginate by line count
+        all_lines = [l.strip() for l in summary_text.split("\n") if l.strip()]
+        max_lines_per_slide = 14
+        summary_pages = []
+        for i in range(0, len(all_lines), max_lines_per_slide):
+            summary_pages.append(all_lines[i:i + max_lines_per_slide])
+
+        # If only one page but too many chars, split by char count
+        if len(summary_pages) == 1 and len(summary_text) > 700:
+            summary_pages = []
+            remaining = summary_text
+            while remaining:
+                if len(remaining) <= 700:
+                    summary_pages.append(remaining.split("\n"))
+                    break
+                cut = remaining.rfind("。", 0, 700)
+                if cut < 0:
+                    cut = remaining.rfind(". ", 0, 700)
+                if cut < 0:
+                    cut = remaining.rfind("\n", 0, 700)
+                if cut < 0:
+                    cut = 700
+                summary_pages.append([l.strip() for l in remaining[:cut + 1].split("\n") if l.strip()])
+                remaining = remaining[cut + 1:].strip()
+
+        for pg_idx, pg_lines in enumerate(summary_pages):
+            sum_slide = prs.slides.add_slide(prs.slide_layouts[6])
+            set_bg(sum_slide, colors["bg"])
+
+            stitle = "Executive Summary"
+            if len(summary_pages) > 1:
+                stitle += f" ({pg_idx + 1}/{len(summary_pages)})"
+            shBox = sum_slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(11.5), Inches(0.7))
+            shtf = shBox.text_frame
+            shp = shtf.paragraphs[0]
+            shp.text = stitle
+            shp.font.size = Pt(28)
+            shp.font.bold = True
+            shp.font.color.rgb = colors["title"]
+
+            sbBox = sum_slide.shapes.add_textbox(Inches(0.8), Inches(1.1), Inches(11.5), Inches(6.0))
+            sbtf = sbBox.text_frame
+            sbtf.word_wrap = True
+            first = True
+            for line in pg_lines:
+                if not line:
+                    continue
+                sp = sbtf.paragraphs[0] if first else sbtf.add_paragraph()
+                first = False
+                sp.text = line
+                sp.font.size = Pt(14)
+                sp.font.color.rgb = colors["text"]
+                sp.space_after = Pt(3)
 
     # --- Content Slides ---
-    for slide_data in data["slides"]:
+    for slide_idx, slide_data in enumerate(data["slides"]):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         set_bg(slide, colors["bg"])
 
@@ -441,35 +691,47 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None) -> str:
                 ep.font.color.rgb = colors["sub"]
                 ep.space_after = Pt(6)
 
-        # Source link at bottom of each slide
-        if source_url:
+        # Source link at bottom — rotate through all sources
+        if all_sources:
+            src = all_sources[slide_idx % len(all_sources)]
+            src_domain = urlparse(normalize_url(src)).netloc
             linkBox = slide.shapes.add_textbox(Inches(0.8), Inches(6.6), Inches(11), Inches(0.4))
             ltf = linkBox.text_frame
             lp = ltf.paragraphs[0]
-            add_hyperlink(lp, source_url, f"📎 {source_title[:70]}", Pt(10), colors["link"], slide_part=slide.part)
+            add_hyperlink(lp, src, f"📎 {src_domain}", Pt(10), colors["link"], slide_part=slide.part)
 
-    # --- Issues/Warnings Slide ---
+    # --- Issues/Warnings Slides (paginated) ---
     if issues:
-        issue_slide = prs.slides.add_slide(prs.slide_layouts[6])
-        set_bg(issue_slide, colors["bg"])
+        issues_per_page = 12
+        for page_start in range(0, len(issues), issues_per_page):
+            page_issues = issues[page_start:page_start + issues_per_page]
+            page_num = page_start // issues_per_page + 1
+            total_pages = (len(issues) + issues_per_page - 1) // issues_per_page
 
-        ihBox = issue_slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(11.5), Inches(0.7))
-        ihtf = ihBox.text_frame
-        ihp = ihtf.paragraphs[0]
-        ihp.text = "⚠️ Issues & Warnings"
-        ihp.font.size = Pt(28)
-        ihp.font.bold = True
-        ihp.font.color.rgb = RGBColor(0xE9, 0x4F, 0x37)
+            issue_slide = prs.slides.add_slide(prs.slide_layouts[6])
+            set_bg(issue_slide, colors["bg"])
 
-        ibBox = issue_slide.shapes.add_textbox(Inches(0.8), Inches(1.2), Inches(11.5), Inches(5.5))
-        ibtf = ibBox.text_frame
-        ibtf.word_wrap = True
-        for i, issue in enumerate(issues):
-            ip = ibtf.paragraphs[0] if i == 0 else ibtf.add_paragraph()
-            ip.text = f"• {issue}"
-            ip.font.size = Pt(14)
-            ip.font.color.rgb = RGBColor(0xFF, 0xAA, 0x00)
-            ip.space_after = Pt(4)
+            title_text = "⚠️ Issues & Warnings"
+            if total_pages > 1:
+                title_text += f" ({page_num}/{total_pages})"
+
+            ihBox = issue_slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(11.5), Inches(0.7))
+            ihtf = ihBox.text_frame
+            ihp = ihtf.paragraphs[0]
+            ihp.text = title_text
+            ihp.font.size = Pt(28)
+            ihp.font.bold = True
+            ihp.font.color.rgb = RGBColor(0xE9, 0x4F, 0x37)
+
+            ibBox = issue_slide.shapes.add_textbox(Inches(0.8), Inches(1.2), Inches(11.5), Inches(5.5))
+            ibtf = ibBox.text_frame
+            ibtf.word_wrap = True
+            for i, issue in enumerate(page_issues):
+                ip = ibtf.paragraphs[0] if i == 0 else ibtf.add_paragraph()
+                ip.text = f"• {issue}"
+                ip.font.size = Pt(13)
+                ip.font.color.rgb = RGBColor(0xFF, 0xAA, 0x00)
+                ip.space_after = Pt(3)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(OUTPUT_DIR, f"keynote_{timestamp}.pptx")
@@ -503,15 +765,227 @@ Topic: {prompt}
     return json.loads(raw)
 
 
+RSS_FEEDS = {
+    "marketwatch.com": [
+        "https://www.marketwatch.com/rss/topstories",
+        "https://www.marketwatch.com/rss/marketpulse",
+    ],
+    "wsj.com": [
+        "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+        "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    ],
+}
+
+# Sites that need Google News RSS as proxy (strong bot detection, no RSS)
+# Note: Google News URLs can't be resolved to original URLs, so articles
+# from these sites are title-only (no deep-scan)
+GOOGLE_NEWS_FALLBACK = {"reuters.com", "investopedia.com"}
+
+
+def crawl_rss_feeds(feed_urls: list[str], max_links: int = 80) -> list[dict]:
+    """Fetch article links from RSS feeds."""
+    links = []
+    seen = set()
+    for feed_url in feed_urls:
+        try:
+            res = requests.get(feed_url, headers={"User-Agent": BROWSER_UA}, timeout=15)
+            res.raise_for_status()
+            soup = BeautifulSoup(res.content, "lxml-xml")
+            for item in soup.find_all("item"):
+                title_tag = item.find("title")
+                link_tag = item.find("link")
+                if not title_tag or not link_tag:
+                    continue
+                title = title_tag.get_text(strip=True)
+                url = link_tag.get_text(strip=True)
+                if url in seen or not title or len(title) < 10:
+                    continue
+                seen.add(url)
+                links.append({"url": url, "title": title})
+                if len(links) >= max_links:
+                    return links
+        except Exception:
+            continue
+    return links
+
+
+def crawl_google_news(domain: str, max_links: int = 80) -> list[dict]:
+    """Use Google News RSS as proxy for sites that block direct crawl."""
+    feed_url = f"https://news.google.com/rss/search?q=site:{domain}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        res = requests.get(feed_url, headers={"User-Agent": BROWSER_UA}, timeout=15)
+        res.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(res.content, "lxml-xml")
+    links = []
+    seen = set()
+    for item in soup.find_all("item"):
+        title_tag = item.find("title")
+        link_tag = item.find("link")
+        if not title_tag or not link_tag:
+            continue
+        title = title_tag.get_text(strip=True)
+        # Clean title — Google appends " - Source Name"
+        title = re.sub(r'\s*-\s*[^-]+$', '', title).strip()
+        gn_url = link_tag.get_text(strip=True)
+        # Resolve Google redirect to actual article URL
+        url = resolve_google_news_url(gn_url)
+        if url in seen or not title or len(title) < 10:
+            continue
+        seen.add(url)
+        links.append({"url": url, "title": title})
+        if len(links) >= max_links:
+            break
+    return links
+
+
+# Search engines — when user adds these as a "site", we search instead of crawl
+# Note: Google blocks scraping; DuckDuckGo and Bing work reliably
+SEARCH_ENGINES = {
+    "google.com": "https://www.google.com/search?q={query}&num={num}",
+    "bing.com": "https://www.bing.com/search?q={query}&count={num}",
+    "duckduckgo.com": "https://html.duckduckgo.com/html/?q={query}",
+}
+
+def search_engine_crawl(engine_domain: str, query: str, max_links: int = 80) -> list[dict]:
+    """Use a search engine to find articles related to a query."""
+    links = []
+    seen = set()
+
+    # Build search URL
+    template = None
+    for domain, url_template in SEARCH_ENGINES.items():
+        if domain in engine_domain:
+            template = url_template
+            break
+    if not template:
+        return []
+
+    search_url = template.format(query=requests.utils.quote(query), num=min(max_links, 30))
+
+    try:
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        res = requests.get(search_url, headers=headers, timeout=15)
+        res.raise_for_status()
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(res.text, "lxml")
+
+    def _extract_real_url(href: str) -> str:
+        """Extract real URL from search engine redirect wrappers."""
+        # DuckDuckGo wraps: //duckduckgo.com/l/?uddg=https%3A%2F%2F...
+        if "uddg=" in href:
+            from urllib.parse import unquote, parse_qs
+            parsed_q = parse_qs(urlparse(href).query)
+            if "uddg" in parsed_q:
+                return unquote(parsed_q["uddg"][0])
+        # Google wraps: /url?q=https://...
+        if "/url?" in href and "q=" in href:
+            from urllib.parse import unquote, parse_qs
+            parsed_q = parse_qs(urlparse(href).query)
+            if "q" in parsed_q:
+                return unquote(parsed_q["q"][0])
+        return href
+
+    # Google results
+    if "google.com" in engine_domain:
+        for div in soup.find_all("div", class_="g"):
+            a = div.find("a", href=True)
+            h3 = div.find("h3")
+            if not a or not h3:
+                continue
+            url = _extract_real_url(a["href"])
+            title = h3.get_text(strip=True)
+            if not url.startswith("http") or "google.com" in url:
+                continue
+            if url not in seen and title and len(title) > 5:
+                seen.add(url)
+                links.append({"url": url, "title": title})
+        # Fallback: if no div.g results, try broader search
+        if not links:
+            for a in soup.find_all("a", href=True):
+                url = _extract_real_url(a["href"])
+                h3 = a.find("h3")
+                if not h3:
+                    continue
+                title = h3.get_text(strip=True)
+                if not url.startswith("http") or "google.com" in url:
+                    continue
+                if url not in seen and title and len(title) > 5:
+                    seen.add(url)
+                    links.append({"url": url, "title": title})
+
+    # Bing results
+    elif "bing.com" in engine_domain:
+        for li in soup.find_all("li", class_="b_algo"):
+            a = li.find("a", href=True)
+            if not a:
+                continue
+            url = _extract_real_url(a["href"])
+            title = a.get_text(strip=True)
+            if not url.startswith("http") or "bing.com" in url:
+                continue
+            if url not in seen and title and len(title) > 5:
+                seen.add(url)
+                links.append({"url": url, "title": title})
+
+    # DuckDuckGo results
+    elif "duckduckgo.com" in engine_domain:
+        for a in soup.find_all("a", class_="result__a"):
+            raw_href = a.get("href", "")
+            url = _extract_real_url(raw_href)
+            title = a.get_text(strip=True)
+            if not url.startswith("http") or "duckduckgo.com" in url:
+                continue
+            if url not in seen and title and len(title) > 5:
+                seen.add(url)
+                links.append({"url": url, "title": title})
+
+    return links[:max_links]
+
+
+def is_search_engine(domain: str) -> bool:
+    """Check if a domain is a search engine."""
+    return any(se in domain for se in SEARCH_ENGINES)
+
+
 def crawl_site_links(base_url: str, session: requests.Session | None = None, max_links: int = 80) -> list[dict]:
-    """Crawl a website and extract article links with titles."""
+    """Crawl a website. Falls back to RSS/Google News if direct crawl fails."""
     base_url = normalize_url(base_url)
+    parsed = urlparse(base_url)
+    domain = parsed.netloc.removeprefix("www.")
+
     try:
         s = session or requests.Session()
         s.headers.setdefault("User-Agent", BROWSER_UA)
+        # If session has no cookies, try auto-loading for this domain
+        if not s.cookies:
+            fresh = build_session_for_url(base_url)
+            if fresh.cookies:
+                s.cookies.update(fresh.cookies)
         res = s.get(base_url, timeout=15)
         res.raise_for_status()
     except Exception as e:
+        # Fallback 1: RSS feeds
+        for rss_domain, feeds in RSS_FEEDS.items():
+            if rss_domain in domain:
+                rss_links = crawl_rss_feeds(feeds, max_links)
+                if rss_links:
+                    return rss_links
+        # Fallback 2: Google News RSS proxy
+        for gn_domain in GOOGLE_NEWS_FALLBACK:
+            if gn_domain in domain:
+                gn_links = crawl_google_news(gn_domain, max_links)
+                if gn_links:
+                    return gn_links
         raise ValueError(f"Failed to fetch {base_url}: {e}")
 
     soup = BeautifulSoup(res.text, "lxml")
@@ -574,10 +1048,30 @@ def score_article(title: str, keywords: list[str]) -> float:
     return score_text(title, keywords)
 
 
-def ai_filter_titles(titles: list[dict], prompt: str, model: str = "") -> list[dict]:
-    """Use AI to judge which article titles are relevant to the user's topic.
-    Returns the relevant articles with AI-assigned relevance scores.
-    """
+def ai_filter_titles(titles: list[dict], prompt: str, model: str = "", keywords: list[str] = None, batch_size: int = 60) -> list[dict]:
+    """Pre-filter by keywords, then use AI to judge relevance in batches."""
+    # Step 1: fast keyword pre-filter to reduce volume
+    if keywords and len(titles) > batch_size:
+        scored = []
+        for t in titles:
+            s = score_text(t["title"], keywords)
+            if s > 0:
+                scored.append((s, t))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        titles = [t for _, t in scored[:batch_size * 2]]  # keep top candidates
+
+    # Step 2: batch AI filtering
+    all_results = []
+    for batch_start in range(0, len(titles), batch_size):
+        batch = titles[batch_start:batch_start + batch_size]
+        batch_results = _ai_filter_batch(batch, prompt, model)
+        all_results.extend(batch_results)
+
+    return all_results
+
+
+def _ai_filter_batch(titles: list[dict], prompt: str, model: str = "") -> list[dict]:
+    """AI judges a single batch of titles."""
     title_list = "\n".join(f"{i}. {t['title']}" for i, t in enumerate(titles))
     ai_prompt = f"""
 You are filtering news article titles for relevance to a research topic.
@@ -663,13 +1157,16 @@ def build_session_for_url(url: str, cookies_text: str = "") -> requests.Session:
     parsed = urlparse(url if "://" in url else f"https://{url}")
     domain = parsed.netloc.removeprefix("www.")
     if domain:
-        result = load_browser_cookies("Chrome", domain)
-        if not result.startswith("Error:"):
-            for pair in result.split(";"):
-                pair = pair.strip()
-                if "=" in pair:
-                    name, value = pair.split("=", 1)
-                    session.cookies.set(name.strip(), value.strip())
+        try:
+            result = load_browser_cookies("Chrome", domain)
+            if not result.startswith("Error:"):
+                for pair in result.split(";"):
+                    pair = pair.strip()
+                    if "=" in pair:
+                        name, value = pair.split("=", 1)
+                        session.cookies.set(name.strip(), value.strip())
+        except Exception:
+            pass  # Cookie loading failed silently, proceed without
     return session
 
 
@@ -709,20 +1206,35 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
 
         # Crawl all sites — each with its own session/cookies
         all_links = []
+        search_query = " ".join(keywords[:8])  # Use top keywords as search query
         for site_url in url_list:
-            session = build_session_for_url(site_url, cookies_text)
-            if session.cookies:
-                logs.append(f"🔐 Loaded {len(session.cookies)} cookies for {urlparse(normalize_url(site_url)).netloc}")
-            logs.append(f"🕷️ Crawling {site_url}...")
-            yield "\n".join(logs), kw_display, "", no_update
+            site_domain = urlparse(normalize_url(site_url)).netloc.removeprefix("www.")
 
-            try:
-                site_links = crawl_site_links(site_url, session=session, max_links=80)
-                logs.append(f"  📄 Found {len(site_links)} links from {urlparse(normalize_url(site_url)).netloc}")
-                all_links.extend(site_links)
-            except Exception as e:
-                logs.append(f"  ⚠️ Failed: {e}")
-                _research_issues.append(f"Crawl {urlparse(normalize_url(site_url)).netloc}: {e}")
+            # Detect search engines — search instead of crawl
+            if is_search_engine(site_domain):
+                logs.append(f"🔎 Searching {site_domain} for: {search_query[:50]}...")
+                yield "\n".join(logs), kw_display, "", no_update
+                try:
+                    site_links = search_engine_crawl(site_domain, search_query, max_links=30)
+                    logs.append(f"  📄 Found {len(site_links)} results from {site_domain}")
+                    all_links.extend(site_links)
+                except Exception as e:
+                    logs.append(f"  ⚠️ Search failed: {e}")
+                    _research_issues.append(f"Search {site_domain}: {e}")
+            else:
+                session = build_session_for_url(site_url, cookies_text)
+                if session.cookies:
+                    logs.append(f"🔐 Loaded {len(session.cookies)} cookies for {urlparse(normalize_url(site_url)).netloc}")
+                logs.append(f"🕷️ Crawling {site_url}...")
+                yield "\n".join(logs), kw_display, "", no_update
+
+                try:
+                    site_links = crawl_site_links(site_url, session=session, max_links=80)
+                    logs.append(f"  📄 Found {len(site_links)} links from {urlparse(normalize_url(site_url)).netloc}")
+                    all_links.extend(site_links)
+                except Exception as e:
+                    logs.append(f"  ⚠️ Failed: {e}")
+                    _research_issues.append(f"Crawl {urlparse(normalize_url(site_url)).netloc}: {e}")
 
             yield "\n".join(logs), kw_display, "", no_update
 
@@ -734,7 +1246,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
         logs.append("🧠 AI filtering article titles...")
         yield "\n".join(logs), kw_display, "", no_update
 
-        candidates = ai_filter_titles(links, prompt, model)
+        candidates = ai_filter_titles(links, prompt, model, keywords=keywords)
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
         if not candidates:
@@ -748,8 +1260,8 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
         yield "\n".join(logs), kw_display, "", no_update
 
         # Phase 2: AI reads top candidates and scores relevance
-        top = candidates[:max_articles * 2]
-        logs.append(f"📖 AI reading top {len(top)} articles...")
+        top = candidates[:max_articles]
+        logs.append(f"📖 AI deep-reading top {len(top)} of {len(candidates)} articles...")
         yield "\n".join(logs), kw_display, "", no_update
 
         results = []
@@ -764,7 +1276,6 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
             results.append({**article, "score": combined, "reason": reason})
 
         results.sort(key=lambda x: x["score"], reverse=True)
-        results = results[:max_articles]
         global _research_results
         _research_results = results
 
@@ -836,11 +1347,11 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
 
     # Combine primary URL with any extra URLs from same topic group
     all_urls = [url] + (extra_urls or [])
-    # Deduplicate
+    # Deduplicate and skip Google News redirect URLs (can't be fetched)
     seen = set()
     unique_urls = []
     for u in all_urls:
-        if u not in seen:
+        if u not in seen and "news.google.com/rss/articles/" not in u:
             seen.add(u)
             unique_urls.append(u)
 
@@ -854,6 +1365,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
 
         # Fetch all article content
         all_content = []
+        fetched_sources = []  # Track successfully fetched article URLs
         for i, article_url in enumerate(unique_urls):
             logs.append(f"📥 Fetching [{i+1}/{len(unique_urls)}] {urlparse(normalize_url(article_url)).path[:50]}...")
             yield "\n".join(logs), None, ""
@@ -863,6 +1375,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
                 text = fetch_url(article_url, session)
                 logs.append(f"  ✅ {len(text)} characters")
                 all_content.append(text)
+                fetched_sources.append(article_url)
             except Exception as e:
                 issues.append(f"Fetch {article_url}: {e}")
                 logs.append(f"  ⚠️ {e}")
@@ -870,12 +1383,31 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
                     text = requests.get(f"https://r.jina.ai/{article_url}", timeout=30).text
                     logs.append(f"  ✅ Fallback: {len(text)} characters")
                     all_content.append(text)
+                    fetched_sources.append(article_url)
                 except Exception as e2:
                     issues.append(f"Fallback {article_url}: {e2}")
                     logs.append(f"  ⚠️ Fallback also failed")
             yield "\n".join(logs), None, ""
 
         content = "\n\n---\n\n".join(all_content) if all_content else f"[No content fetched from {url}]"
+
+        # Fetch 1 representative image from the primary article
+        logs.append("🖼️ Looking for article image...")
+        yield "\n".join(logs), None, ""
+        article_image = None
+        for article_url in unique_urls:
+            try:
+                session = build_session_for_url(article_url, cookies_text)
+                imgs = fetch_article_images(article_url, session, max_images=1)
+                if imgs:
+                    article_image = imgs[0]
+                    logs.append(f"  ✅ Found image from {urlparse(normalize_url(article_url)).netloc}")
+                    break
+            except Exception:
+                continue
+        if not article_image:
+            logs.append("  ℹ️ No suitable image found")
+        yield "\n".join(logs), None, ""
 
         logs.append("🌐 Translating & summarizing...")
         yield "\n".join(logs), None, ""
@@ -894,6 +1426,8 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
 
         try:
             data = generate_slide_structure(content, lang1, num_slides, model, source_url=url, source_title=url, user_prompt=user_prompt, lang2=lang2)
+            # Attach all fetched sources for slide-level attribution
+            data["all_sources"] = fetched_sources
             logs.append(f"✅ Structure ready: {len(data['slides'])} slides")
         except Exception as e:
             issues.append(f"Slide generation error: {e}")
@@ -908,12 +1442,36 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         logs.append("📊 Building PPTX...")
         yield "\n".join(logs), None, summary
 
-        path = build_pptx(data, theme, issues=issues)
-        logs.append(f"✅ Saved: {os.path.basename(path)}")
+        data["summary"] = summary
+        pptx_path = build_pptx(data, theme, issues=issues, cover_image=article_image)
+        logs.append(f"✅ Saved: {os.path.basename(pptx_path)}")
+        yield "\n".join(logs), None, summary
+
+        # Export to PDF via Keynote
+        logs.append("📄 Exporting to PDF...")
+        yield "\n".join(logs), None, summary
+
+        pdf_path = pptx_path.replace(".pptx", ".pdf")
+        try:
+            export_script = f'''
+            tell application "Keynote"
+                set theDoc to open POSIX file "{pptx_path}"
+                delay 2
+                export theDoc to POSIX file "{pdf_path}" as PDF
+                close theDoc saving no
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", export_script], timeout=30, check=True)
+            logs.append(f"✅ PDF: {os.path.basename(pdf_path)}")
+            path = pdf_path
+        except Exception as e:
+            issues.append(f"PDF export failed: {e}")
+            logs.append(f"⚠️ PDF export failed, using PPTX: {e}")
+            path = pptx_path
 
         if open_keynote:
-            subprocess.run(["open", "-a", "Keynote", path])
-            logs.append("🎬 Opened in Keynote")
+            subprocess.run(["open", path])
+            logs.append(f"🎬 Opened {os.path.basename(path)}")
 
         yield "\n".join(logs), path, summary
 
@@ -1303,11 +1861,14 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         refresh_btn = gr.Button("↻", elem_classes=["ext-refresh-btn"], scale=1, min_width=40)
 
     saved_sites = load_saved_sites()
+    sites_history = load_sites_history()
+    # Merge: history has all ever-used, saved_sites are currently active
+    all_choices = list(dict.fromkeys(sites_history + saved_sites))  # dedupe, preserve order
     prefs = load_saved_prefs()
 
     research_site = gr.Dropdown(
         label="Site URLs (type and press Enter to add)",
-        choices=saved_sites,
+        choices=all_choices,
         value=saved_sites,
         multiselect=True,
         allow_custom_value=True,
@@ -1341,7 +1902,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                         placeholder="e.g. Impact of AI regulation on tech companies",
                         lines=3,
                     )
-                    research_max = gr.Number(value=prefs["max_articles"], label="Max articles", precision=0, minimum=1)
+                    research_max = gr.Number(value=prefs["max_articles"], label="Articles to deep-scan", precision=0, minimum=1)
                     auto_keynote = gr.Checkbox(value=prefs["auto_keynote"], label="Auto-generate Keynote from top result")
                     research_btn = gr.Button("Search Articles", variant="primary", elem_classes=["ext-generate-btn"])
                 with gr.Column(scale=1):
@@ -1358,7 +1919,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                 pick_theme  = gr.Radio(["Dark", "Light", "Blue"], value=prefs["theme"], label="Theme", scale=2)
             generate_from_research = gr.Button("Generate Keynote from Article", variant="primary", elem_classes=["ext-generate-btn"])
             pick_log     = gr.Textbox(label="Keynote Progress", lines=5, interactive=False, elem_classes=["ext-progress"])
-            pick_file    = gr.File(label="Download .pptx")
+            pick_file    = gr.File(label="Download")
             pick_summary = gr.Textbox(label="Summary", lines=4, interactive=False, elem_classes=["ext-summary"])
 
         # ── Keynote Tab ──
@@ -1372,11 +1933,11 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                         num_slides = gr.Number(value=prefs["slides"], label="Slides", precision=0, minimum=1, scale=1)
                     with gr.Row():
                         theme        = gr.Radio(["Dark", "Light", "Blue"], value=prefs["theme"], label="Theme", scale=2)
-                        open_keynote = gr.Checkbox(value=True, label="Open in Keynote", scale=1)
+                        open_keynote = gr.Checkbox(value=True, label="Auto-open file", scale=1)
                     btn = gr.Button("Generate Keynote", variant="primary", elem_classes=["ext-generate-btn"])
                 with gr.Column(scale=1):
                     log_output     = gr.Textbox(label="Progress", lines=6, interactive=False, elem_classes=["ext-progress"])
-                    file_output    = gr.File(label="Download .pptx")
+                    file_output    = gr.File(label="Download")
                     summary_output = gr.Textbox(label="Summary", lines=5, interactive=False, elem_classes=["ext-summary"])
 
     # ── Event handlers ──
@@ -1462,17 +2023,24 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
 
         num = int(slides or 10)
 
-        # Find related articles in the same topic group
+        # Find related articles in the same topic group (max 3, from different domains)
         extra_urls = []
         top_topic = None
+        top_domain = urlparse(normalize_url(url)).netloc
         for r in _research_results:
             if r.get("url") == url:
                 top_topic = r.get("topic_group")
                 break
         if top_topic:
+            seen_domains = {top_domain}
             for r in _research_results:
                 if r.get("topic_group") == top_topic and r.get("url") != url:
-                    extra_urls.append(r["url"])
+                    r_domain = urlparse(normalize_url(r["url"])).netloc
+                    if r_domain not in seen_domains:
+                        extra_urls.append(r["url"])
+                        seen_domains.add(r_domain)
+                if len(extra_urls) >= 3:
+                    break
 
         # Show transition in both logs
         combine_msg = f" + {len(extra_urls)} related" if extra_urls else ""
