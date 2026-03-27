@@ -19,6 +19,50 @@ PREFERRED_MODELS = [
     "qwen3.5-35b-a3b",
     "qwen3.5-27b-claude-4.6-opus-reasoning-distilled",
 ]
+
+# 2-stage pipeline model routing:
+#   Stage 1 (Extraction): fast bulk work — keywords, filtering, scoring
+#   Stage 2 (Refinement): quality work — summaries, slides, translation
+# Patterns are matched case-insensitively against available model IDs.
+EXTRACTION_MODEL_PATTERN = "35b-a3b"
+REFINEMENT_MODEL_PATTERN = "27b-claude"
+
+
+def pick_stage_model(stage: str, available: list[str], fallback: str = "") -> str:
+    """Pick the best model for a pipeline stage.
+
+    stage: 'extraction' or 'refinement'
+    available: list of loaded model IDs from LM Studio
+    fallback: explicit model override from the UI (used as-is if set)
+
+    Priority:
+      1. If only one model is loaded, use it for everything.
+      2. If both are loaded, route by stage.
+      3. If the stage-specific model is missing, prefer the refinement model.
+    """
+    if fallback:
+        # UI override — but still try to route if the user picked "auto"
+        if fallback != "auto":
+            return fallback
+
+    if not available:
+        return fallback or ""
+
+    pattern = EXTRACTION_MODEL_PATTERN if stage == "extraction" else REFINEMENT_MODEL_PATTERN
+
+    # Try to find the stage-specific model
+    for mid in available:
+        if pattern.lower() in mid.lower():
+            return mid
+
+    # Fallback: prefer refinement model (27B) > extraction model > first available
+    for mid in available:
+        if REFINEMENT_MODEL_PATTERN.lower() in mid.lower():
+            return mid
+    for mid in available:
+        if EXTRACTION_MODEL_PATTERN.lower() in mid.lower():
+            return mid
+    return available[0]
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 SAVED_SITES_FILE = os.path.join(os.path.dirname(__file__), ".saved_sites.json")
@@ -270,17 +314,16 @@ def normalize_url(url: str) -> str:
 
 def resolve_google_news_url(url: str) -> str:
     """Resolve Google News redirect URLs to actual article URLs."""
-    if "news.google.com/rss/articles/" not in url:
+    if "news.google.com" not in url:
         return url
     try:
-        res = requests.head(url, allow_redirects=True, timeout=10, headers={"User-Agent": BROWSER_UA})
-        if res.url and "news.google.com" not in res.url:
-            return res.url
-        # Sometimes HEAD doesn't resolve, try GET
-        res = requests.get(url, allow_redirects=True, timeout=10, headers={"User-Agent": BROWSER_UA})
-        return res.url if res.url else url
+        from googlenewsdecoder import new_decoderv1
+        result = new_decoderv1(url)
+        if result and result.get("status") and result.get("decoded_url"):
+            return result["decoded_url"]
     except Exception:
-        return url
+        pass
+    return url
 
 
 def fetch_url(url: str, session: requests.Session | None = None) -> str:
@@ -369,6 +412,7 @@ Consider this context when summarizing — focus on aspects most relevant to the
 Translate and provide a comprehensive summary of the following content into {language}.
 The summary should be detailed and thorough (500-800 words). Cover all key points, data, quotes, and analysis.
 Do NOT be brief — include specific numbers, names, dates, and details from the article(s).
+ALWAYS use Arabic numerals with thousand separators for ALL numbers regardless of language (write "$1,250,000" not "one million" or "一百二十五萬", "3,500" not "three thousand" or "三千五百", "7.2%" not "seven percent" or "百分之七"). Never spell out numbers in any language — always use digits like 1,000 or 25.5%.
 {user_instruction}
 Content:
 {content[:12000]}
@@ -406,45 +450,94 @@ def _slide_json_template(lang1: str, lang2: str = "") -> str:
 }}"""
 
 
-def generate_slide_structure(content: str, language: str, num_slides: int, model: str = "", source_url: str = "", source_title: str = "", user_prompt: str = "", lang2: str = "") -> dict:
-    """Generate structured slide JSON from content — supports single or dual-language."""
-    user_instruction = ""
-    if user_prompt:
-        user_instruction = f"""
-The user's original research prompt was: "{user_prompt}"
-Use this to guide the presentation angle, emphasis, and what aspects to highlight.
-If the prompt contains specific requests about how to present or summarize, follow those instructions.
-"""
+def _build_slide_prompt(content: str, language: str, num_slides: int, lang2: str = "", user_instruction: str = "", slide_context: str = "") -> str:
+    """Build the prompt for generating slides."""
     if lang2:
         lang_instruction = f"Each slide MUST have BOTH {language} AND {lang2} versions of the heading and bullets."
     else:
         lang_instruction = f"All content must be in {language}."
 
-    prompt = f"""
-Create a keynote presentation structure with exactly {num_slides} content slides.
+    return f"""
+Create exactly {num_slides} content slides for a keynote presentation.
 {lang_instruction}
 {user_instruction}
-IMPORTANT rules for content quality:
+{slide_context}
+IMPORTANT rules:
 - Each slide MUST have 4-6 detailed bullet points
-- Each bullet should be a full sentence (15-30 words), not just a short phrase
-- Include specific data: numbers, percentages, dollar amounts, dates, company names
-- Cover different angles: facts, analysis, market impact, expert quotes, future outlook
-- Spread the content across all {num_slides} slides — do NOT front-load everything into the first few slides
-- Each slide should have a distinct sub-topic or angle
-- If multiple articles are provided (separated by ---), SYNTHESIZE the information from ALL sources, do NOT just repeat one article
-- Combine complementary details from different sources to build a comprehensive picture
+- Each bullet: full sentence (15-30 words), include specific data
+- Cover different angles: facts, analysis, market impact, quotes, outlook
+- Each slide should have a distinct sub-topic
+- SYNTHESIZE information from ALL sources if multiple are provided
+- ALWAYS use Arabic numerals with thousand separators ("$1,250,000" not "one million", "3,500" not "three thousand", "7.2%" not "seven percent")
 
-Based on this content:
+Content:
+{content}
 
-{content[:15000]}
-
-Respond ONLY with valid JSON in this exact format, no markdown, no extra text:
+Respond ONLY with valid JSON, no markdown:
 {_slide_json_template(language, lang2)}
 """
-    raw = chat(prompt, model)
-    raw = raw.strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(raw)
-    # Attach source info for slides to reference
+
+
+def generate_slide_structure(content: str, language: str, num_slides: int, model: str = "", source_url: str = "", source_title: str = "", user_prompt: str = "", lang2: str = "") -> dict:
+    """Generate structured slide JSON — batches into groups of 5 for reliability."""
+    user_instruction = ""
+    if user_prompt:
+        user_instruction = f"""
+The user's original research prompt was: "{user_prompt}"
+Use this to guide the presentation angle, emphasis, and what aspects to highlight.
+"""
+    # Truncate content to avoid timeout
+    max_content = min(10000, len(content))
+    truncated = content[:max_content]
+
+    # For small slide counts, generate in one shot
+    if num_slides <= 5:
+        prompt = _build_slide_prompt(truncated, language, num_slides, lang2, user_instruction)
+        raw = chat(prompt, model)
+        raw = raw.strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+    else:
+        # Batch: generate in groups of 4 slides with content chunks
+        all_slides = []
+        batch_size = 4
+        topics_so_far = []
+        first_batch_data = None
+        num_batches = (num_slides + batch_size - 1) // batch_size
+        # Split content across batches so each gets a portion
+        chunk_size = max(2000, len(truncated) // num_batches)
+
+        for batch_idx, batch_start in enumerate(range(0, num_slides, batch_size)):
+            batch_count = min(batch_size, num_slides - batch_start)
+            # Each batch gets a different chunk of content + overlap
+            content_start = max(0, batch_idx * chunk_size - 500)
+            content_chunk = truncated[content_start:content_start + chunk_size + 500]
+
+            context = ""
+            if topics_so_far:
+                context = f"Previous slides covered: {', '.join(topics_so_far)}. Generate {batch_count} NEW slides on DIFFERENT angles."
+
+            prompt = _build_slide_prompt(content_chunk, language, batch_count, lang2, user_instruction, context)
+            try:
+                raw = chat(prompt, model)
+                raw = raw.strip().replace("```json", "").replace("```", "").strip()
+                batch_data = json.loads(raw)
+            except Exception:
+                continue
+            batch_slides = batch_data.get("slides", [])
+            all_slides.extend(batch_slides)
+            if first_batch_data is None:
+                first_batch_data = batch_data
+
+            for s in batch_slides:
+                heading = s.get("heading_primary", s.get("heading_en", s.get("heading", "")))
+                if heading:
+                    topics_so_far.append(heading[:30])
+
+        data = first_batch_data if first_batch_data else {"slides": all_slides}
+        data["slides"] = all_slides
+
+    # Attach source info
+    data = data if isinstance(data, dict) else {"slides": all_slides}
     if source_url:
         data["source_url"] = source_url
         data["source_title"] = source_title or source_url
@@ -733,8 +826,34 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
                 ip.font.color.rgb = RGBColor(0xFF, 0xAA, 0x00)
                 ip.space_after = Pt(3)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(OUTPUT_DIR, f"keynote_{timestamp}.pptx")
+    # Build descriptive filename: date + English title + translated title
+    timestamp = datetime.now().strftime("%Y%m%d")
+    title_pri = data.get("title_primary", data.get("title_zh", data.get("title", "")))
+    title_sec = data.get("title_secondary", data.get("title_en", ""))
+    # Figure out which is English — secondary is usually English when primary is translated
+    # If primary looks like English (ASCII), swap
+    is_pri_english = all(ord(c) < 128 for c in title_pri.replace(" ", "")) if title_pri else False
+    if is_pri_english:
+        title_en = title_pri
+        title_translated = title_sec
+    else:
+        title_en = title_sec
+        title_translated = title_pri
+
+    def _sanitize(s: str, max_len: int = 30) -> str:
+        """Clean string for use in filename."""
+        s = re.sub(r'[\\/:*?"<>|]', '', s)
+        s = re.sub(r'\s+', '_', s.strip())
+        return s[:max_len].rstrip('_')
+
+    parts = [timestamp]
+    if title_en:
+        parts.append(_sanitize(title_en))
+    if title_translated and title_translated != title_en:
+        parts.append(_sanitize(title_translated))
+    filename = "_".join(parts) or f"keynote_{timestamp}"
+
+    path = os.path.join(OUTPUT_DIR, f"{filename}.pptx")
     prs.save(path)
     return path
 
@@ -841,6 +960,9 @@ def crawl_google_news(domain: str, max_links: int = 80) -> list[dict]:
             break
     return links
 
+
+# Domains where article content can't be fetched (paywall + cookie encryption)
+# Titles from these are still used for AI filtering, but deep-scan will skip them
 
 # Search engines — when user adds these as a "site", we search instead of crawl
 # Note: Google blocks scraping; DuckDuckGo and Bing work reliably
@@ -1048,24 +1170,31 @@ def score_article(title: str, keywords: list[str]) -> float:
     return score_text(title, keywords)
 
 
-def ai_filter_titles(titles: list[dict], prompt: str, model: str = "", keywords: list[str] = None, batch_size: int = 60) -> list[dict]:
+def ai_filter_titles(titles: list[dict], prompt: str, model: str = "", keywords: list[str] = None, batch_size: int = 40) -> list[dict]:
     """Pre-filter by keywords, then use AI to judge relevance in batches."""
-    # Step 1: fast keyword pre-filter to reduce volume
-    if keywords and len(titles) > batch_size:
+    # Step 1: fast keyword pre-filter — always run, keep top 80
+    max_to_ai = 80
+    if keywords:
         scored = []
         for t in titles:
             s = score_text(t["title"], keywords)
-            if s > 0:
+            if s > 0.05:  # Require meaningful match, not just 1 common word
                 scored.append((s, t))
         scored.sort(key=lambda x: x[0], reverse=True)
-        titles = [t for _, t in scored[:batch_size * 2]]  # keep top candidates
+        titles = [t for _, t in scored[:max_to_ai]]
+    elif len(titles) > max_to_ai:
+        titles = titles[:max_to_ai]
 
-    # Step 2: batch AI filtering
+    # Step 2: batch AI filtering (smaller batches for reliability)
     all_results = []
     for batch_start in range(0, len(titles), batch_size):
         batch = titles[batch_start:batch_start + batch_size]
-        batch_results = _ai_filter_batch(batch, prompt, model)
-        all_results.extend(batch_results)
+        try:
+            batch_results = _ai_filter_batch(batch, prompt, model)
+            all_results.extend(batch_results)
+        except Exception:
+            # If a batch fails, skip it rather than crashing everything
+            continue
 
     return all_results
 
@@ -1195,11 +1324,20 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
     # Save sites for future use
     save_sites(url_list)
 
+    # Resolve stage-specific models
+    available = get_available_models()
+    ext_model = pick_stage_model("extraction", available, model)
+    ref_model = pick_stage_model("refinement", available, model)
+    if ext_model != ref_model:
+        logs.append(f"🔀 2-stage pipeline: extraction → {ext_model.split('/')[-1]}, refinement → {ref_model.split('/')[-1]}")
+    else:
+        logs.append(f"🤖 Model: {ext_model.split('/')[-1]}")
+
     try:
         logs.append("🔍 Analyzing prompt with AI...")
         yield "\n".join(logs), "", "", no_update
 
-        keywords = extract_keywords(prompt, model)
+        keywords = extract_keywords(prompt, ext_model)
         kw_display = ", ".join(keywords)
         logs.append(f"🔑 Keywords: {kw_display}")
         yield "\n".join(logs), kw_display, "", no_update
@@ -1242,11 +1380,11 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
         logs.append(f"📄 Total: {len(links)} article links from {len(url_list)} site(s)")
         yield "\n".join(logs), kw_display, "", no_update
 
-        # Phase 1: AI judges which titles are relevant
-        logs.append("🧠 AI filtering article titles...")
+        # Phase 1: AI judges which titles are relevant (keyword pre-filtered internally)
+        logs.append(f"🧠 AI filtering from {len(links)} titles...")
         yield "\n".join(logs), kw_display, "", no_update
 
-        candidates = ai_filter_titles(links, prompt, model, keywords=keywords)
+        candidates = ai_filter_titles(links, prompt, ext_model, keywords=keywords)
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
         if not candidates:
@@ -1270,7 +1408,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
             yield "\n".join(logs), kw_display, "", no_update
 
             art_session = build_session_for_url(article["url"], cookies_text)
-            ai_result = ai_score_article(article["url"], prompt, art_session, model)
+            ai_result = ai_score_article(article["url"], prompt, art_session, ext_model)
             combined = (article["score"] * 0.4) + (ai_result["score"] * 0.6)
             reason = ai_result.get("reason") or article.get("reason", "")
             results.append({**article, "score": combined, "reason": reason})
@@ -1298,7 +1436,7 @@ Return ONLY valid JSON, no markdown:
   {{"topic": "Brief topic name", "articles": [0, 2, 5], "summary": "What these articles share"}}
 ]
 """
-                raw = chat(group_prompt, model)
+                raw = chat(group_prompt, ref_model)
                 raw = raw.strip().replace("```json", "").replace("```", "").strip()
                 topic_groups = json.loads(raw)
                 logs.append(f"📊 Found {len(topic_groups)} topic groups:")
@@ -1331,7 +1469,13 @@ Return ONLY valid JSON, no markdown:
 
         result_text = "\n".join(output_lines)
         logs.append(f"\n✅ Found {len(results)} relevant articles")
-        top_choice = url_choices[0] if url_choices else ""
+        # Prefer a fetchable article as the default selection
+        top_choice = ""
+        for r in results:
+            top_choice = f"{r['title'][:60]}  |  {r['url']}"
+            break
+        if not top_choice and url_choices:
+            top_choice = url_choices[0]
         yield "\n".join(logs), kw_display, result_text, gr.update(choices=url_choices, value=top_choice)
 
     except Exception as e:
@@ -1345,21 +1489,30 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
     issues = list(_research_issues)  # Carry over any crawl issues
     lang2 = lang2 if lang2 and lang2 != "None" else ""
 
-    # Combine primary URL with any extra URLs from same topic group
+    # Resolve refinement model for translation & slide generation
+    available = get_available_models()
+    ref_model = pick_stage_model("refinement", available, model)
+
+    # Combine primary URL with any extra URLs
     all_urls = [url] + (extra_urls or [])
-    # Deduplicate and skip Google News redirect URLs (can't be fetched)
+    # Resolve Google News URLs and deduplicate
     seen = set()
     unique_urls = []
     for u in all_urls:
-        if u not in seen and "news.google.com/rss/articles/" not in u:
-            seen.add(u)
-            unique_urls.append(u)
+        u = resolve_google_news_url(u)  # Decode Google News redirect
+        if u in seen:
+            continue
+        seen.add(u)
+        unique_urls.append(u)
+    if not unique_urls:
+        unique_urls = [url]
 
     try:
         lang_label = f"{lang1} + {lang2}" if lang2 else lang1
         if user_prompt:
             logs.append(f"📝 User prompt: {user_prompt[:80]}...")
         logs.append(f"🌍 Languages: {lang_label}")
+        logs.append(f"🤖 Refinement model: {ref_model.split('/')[-1]}")
         if len(unique_urls) > 1:
             logs.append(f"📰 Combining {len(unique_urls)} related articles")
 
@@ -1413,7 +1566,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         yield "\n".join(logs), None, ""
 
         try:
-            summary = translate_content(content, lang1, model, user_prompt=user_prompt)
+            summary = translate_content(content, lang1, ref_model, user_prompt=user_prompt)
             logs.append("✅ Translation done")
         except Exception as e:
             issues.append(f"Translation error: {e}")
@@ -1421,11 +1574,12 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
             logs.append(f"⚠️ Translation failed, using raw content excerpt")
         yield "\n".join(logs), None, summary
 
-        logs.append(f"🧠 Generating {num_slides} slides...")
+        batch_info = f" (in batches of 4)" if num_slides > 5 else ""
+        logs.append(f"🧠 Generating {num_slides} slides{batch_info}...")
         yield "\n".join(logs), None, summary
 
         try:
-            data = generate_slide_structure(content, lang1, num_slides, model, source_url=url, source_title=url, user_prompt=user_prompt, lang2=lang2)
+            data = generate_slide_structure(content, lang1, num_slides, ref_model, source_url=url, source_title=url, user_prompt=user_prompt, lang2=lang2)
             # Attach all fetched sources for slide-level attribution
             data["all_sources"] = fetched_sources
             logs.append(f"✅ Structure ready: {len(data['slides'])} slides")
@@ -1447,31 +1601,49 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         logs.append(f"✅ Saved: {os.path.basename(pptx_path)}")
         yield "\n".join(logs), None, summary
 
-        # Export to PDF via Keynote
-        logs.append("📄 Exporting to PDF...")
+        # Export to Keynote (.key) and PDF via Keynote
+        logs.append("📄 Exporting to Keynote & PDF...")
         yield "\n".join(logs), None, summary
 
+        key_path = pptx_path.replace(".pptx", ".key")
         pdf_path = pptx_path.replace(".pptx", ".pdf")
         try:
             export_script = f'''
             tell application "Keynote"
+                activate
                 set theDoc to open POSIX file "{pptx_path}"
-                delay 2
+                -- Wait for Keynote to finish importing
+                repeat 30 times
+                    try
+                        if playing of theDoc is false then exit repeat
+                    end try
+                    delay 1
+                end repeat
+                delay 3
+                save theDoc in POSIX file "{key_path}"
+                delay 1
                 export theDoc to POSIX file "{pdf_path}" as PDF
+                delay 1
                 close theDoc saving no
             end tell
             '''
-            subprocess.run(["osascript", "-e", export_script], timeout=30, check=True)
+            subprocess.run(["osascript", "-e", export_script], timeout=120, check=True)
+            logs.append(f"✅ Keynote: {os.path.basename(key_path)}")
             logs.append(f"✅ PDF: {os.path.basename(pdf_path)}")
+            # Remove intermediate PPTX
+            try:
+                os.remove(pptx_path)
+            except OSError:
+                pass
             path = pdf_path
         except Exception as e:
-            issues.append(f"PDF export failed: {e}")
-            logs.append(f"⚠️ PDF export failed, using PPTX: {e}")
+            issues.append(f"Export failed: {e}")
+            logs.append(f"⚠️ Export failed, using PPTX: {e}")
             path = pptx_path
 
         if open_keynote:
-            subprocess.run(["open", path])
-            logs.append(f"🎬 Opened {os.path.basename(path)}")
+            subprocess.run(["open", key_path if os.path.exists(key_path) else path])
+            logs.append(f"🎬 Opened {os.path.basename(key_path if os.path.exists(key_path) else path)}")
 
         yield "\n".join(logs), path, summary
 
@@ -1815,23 +1987,35 @@ footer { display: none !important; }
 """
 
 available_models = get_available_models()
-default_model = pick_default_model(available_models)
+_has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in available_models)
+_has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in available_models)
+if _has_ext and _has_ref:
+    available_models = ["auto"] + available_models
+    default_model = "auto"
+else:
+    default_model = pick_default_model(available_models)
 
 progress_js = """
 () => {
-    // Watch progress textareas and toggle 'active' class on content change
     const observer = new MutationObserver(() => {
+        // Progress bar pulse
         document.querySelectorAll('.ext-progress textarea').forEach(ta => {
             const wrapper = ta.closest('.ext-progress');
             if (!wrapper) return;
             if (ta.value && ta.value.trim()) {
                 wrapper.classList.add('ext-active');
-                // Clear existing timer
                 clearTimeout(wrapper._pulseTimer);
-                // Stop pulsing after 3s of no changes
                 wrapper._pulseTimer = setTimeout(() => {
                     wrapper.classList.remove('ext-active');
                 }, 3000);
+            }
+        });
+        // Auto-download: click download link when file appears
+        document.querySelectorAll('a[download]').forEach(a => {
+            if (a.dataset.autoDownloaded) return;
+            if (a.href && a.href.includes('/file=')) {
+                a.dataset.autoDownloaded = 'true';
+                setTimeout(() => a.click(), 500);
             }
         });
     });
@@ -1943,8 +2127,12 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
     # ── Event handlers ──
     def refresh_models():
         models = get_available_models()
-        default = pick_default_model(models)
-        return gr.update(choices=models, value=default)
+        # If both extraction and refinement models are available, offer "auto" for 2-stage routing
+        has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in models)
+        has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in models)
+        choices = (["auto"] if has_ext and has_ref else []) + models
+        default = "auto" if has_ext and has_ref else pick_default_model(models)
+        return gr.update(choices=choices, value=default)
 
     def on_load_cookies(browser, site_urls):
         # Support both list (multiselect) and string
@@ -2023,24 +2211,28 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
 
         num = int(slides or 10)
 
-        # Find related articles in the same topic group (max 3, from different domains)
+        # Gather top fetchable articles from research results
         extra_urls = []
-        top_topic = None
         top_domain = urlparse(normalize_url(url)).netloc
+        domain_counts = {top_domain: 1}
+        max_per_domain = 2
+        max_extras = 6
         for r in _research_results:
             if r.get("url") == url:
-                top_topic = r.get("topic_group")
+                continue
+            r_url = r.get("url", "")
+            r_domain = urlparse(normalize_url(r_url)).netloc.removeprefix("www.")
+            # Resolve Google News URLs to actual article URLs
+            r_url = resolve_google_news_url(r_url)
+            r_domain = urlparse(normalize_url(r_url)).netloc.removeprefix("www.")
+            # Skip unfetchable
+            # Allow up to max_per_domain articles from same domain
+            if domain_counts.get(r_domain, 0) >= max_per_domain:
+                continue
+            extra_urls.append(r_url)
+            domain_counts[r_domain] = domain_counts.get(r_domain, 0) + 1
+            if len(extra_urls) >= max_extras:
                 break
-        if top_topic:
-            seen_domains = {top_domain}
-            for r in _research_results:
-                if r.get("topic_group") == top_topic and r.get("url") != url:
-                    r_domain = urlparse(normalize_url(r["url"])).netloc
-                    if r_domain not in seen_domains:
-                        extra_urls.append(r["url"])
-                        seen_domains.add(r_domain)
-                if len(extra_urls) >= 3:
-                    break
 
         # Show transition in both logs
         combine_msg = f" + {len(extra_urls)} related" if extra_urls else ""
