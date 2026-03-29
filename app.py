@@ -2141,7 +2141,9 @@ body {
     border: none !important;
     box-shadow: none !important;
 }
-.gradio-container .row { gap: 8px !important; align-items: end !important; }
+.gradio-container .row,
+.gradio-container .gr-row,
+.gradio-container [class*="row"] { gap: 8px !important; align-items: end !important; }
 
 /* ── Header bar ── */
 .ext-header {
@@ -2275,18 +2277,6 @@ body {
 .ext-generate-btn:hover { opacity: 0.9 !important; }
 .ext-generate-btn:active { transform: scale(0.98) !important; }
 
-.ext-refresh-btn {
-    background: #333 !important;
-    color: #aaa !important;
-    border: 1px solid #444 !important;
-    border-radius: 5px !important;
-    font-size: 13px !important;
-    padding: 6px 8px !important;
-    min-width: 36px !important;
-    height: 34px !important;
-    cursor: pointer;
-}
-.ext-refresh-btn:hover { background: #3e3e3e !important; }
 
 /* ── Slider compact ── */
 .gradio-container input[type="range"] { accent-color: #1a73e8; }
@@ -2448,116 +2438,262 @@ body {
     display: none !important;
 }
 
+/* ── Output files panel — scrollable container ── */
+.ext-output-panel {
+    border: 1px solid #333 !important;
+    background: #252525 !important;
+    border-radius: 8px !important;
+    margin: 6px 0 !important;
+    padding: 0 !important;
+    max-height: 420px !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+}
+.ext-output-header {
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    color: #ccc !important;
+    padding: 10px 12px 4px !important;
+    position: sticky !important;
+    top: 0 !important;
+    background: #252525 !important;
+    z-index: 5 !important;
+    border-bottom: 1px solid #333 !important;
+    margin-bottom: 4px !important;
+}
+/* Action bar — floating toolbar when files selected */
+.ext-action-bar {
+    padding: 6px 8px !important;
+    margin: 4px 8px !important;
+    background: #333 !important;
+    border: 1px solid #555 !important;
+    border-radius: 8px !important;
+    gap: 6px !important;
+    flex-direction: row !important;
+    justify-content: center !important;
+}
+.ext-action-bar button {
+    font-size: 12px !important;
+    padding: 6px 14px !important;
+    border-radius: 6px !important;
+    min-height: 32px !important;
+    margin: 0 !important;
+}
+.ext-output-panel table {
+    font-size: 11px !important;
+}
+.ext-output-panel table th {
+    position: sticky !important;
+    top: 76px !important;
+    background: #2b2b2b !important;
+    z-index: 3 !important;
+}
+
 /* ── Hide footer ── */
 footer { display: none !important; }
 
 /* ══════════════════════════════════════════════
-   Mobile / responsive (≤768px)
+   Mobile SPA — (≤768px)
    ══════════════════════════════════════════════ */
 @media (max-width: 768px) {
-    /* Container — full width, less padding */
-    .gradio-container {
-        max-width: 100% !important;
-        padding: 0 6px 8px !important;
-        border: none !important;
-        box-shadow: none !important;
+    /* ── SPA shell — no horizontal scroll ── */
+    html, body {
+        overflow-x: hidden !important;
+        -webkit-text-size-adjust: 100% !important;
+    }
+    body {
+        background: #1e1e1e !important;
+        -webkit-tap-highlight-color: transparent;
     }
 
-    /* Header */
-    .ext-header {
-        margin: 0 -6px 8px !important;
-        padding: 10px 12px !important;
-    }
-    .ext-header h3 { font-size: 15px !important; }
-
-    /* Rows — stack vertically on mobile */
-    .gradio-container .row {
+    /* ── Nuclear: force ALL horizontal flex to stack ── */
+    .gradio-container div[style*="flex-direction"],
+    .gradio-container .flex,
+    .gradio-container .gap {
         flex-direction: column !important;
-        gap: 4px !important;
         align-items: stretch !important;
     }
-    /* Let each item in a row take full width */
-    .gradio-container .row > * {
+    .gradio-container .flex > *,
+    .gradio-container .gap > * {
+        width: 100% !important;
         min-width: 100% !important;
         flex: 1 1 100% !important;
     }
-
-    /* Columns — stack vertically */
-    .gradio-container .column {
-        min-width: 100% !important;
+    /* Exception: keep radio/checkbox groups horizontal */
+    .gradio-container .wrap:has(> label > input[type="radio"]),
+    .gradio-container .wrap:has(> label > input[type="checkbox"]) {
+        flex-direction: row !important;
+        flex-wrap: wrap !important;
+        align-items: center !important;
+    }
+    .gradio-container .wrap:has(> label > input[type="radio"]) > *,
+    .gradio-container .wrap:has(> label > input[type="checkbox"]) > * {
+        width: auto !important;
+        min-width: auto !important;
+        flex: 0 0 auto !important;
+    }
+    /* Exception: keep tab nav horizontal */
+    .ext-tabs > .tab-nav {
+        flex-direction: row !important;
+    }
+    .ext-tabs > .tab-nav > * {
+        width: auto !important;
+        min-width: auto !important;
+        flex: 0 0 auto !important;
+    }
+    /* Exception: keep action bar horizontal */
+    .ext-action-bar {
+        flex-direction: row !important;
+    }
+    .ext-action-bar > * {
+        width: auto !important;
+        min-width: auto !important;
+        flex: 1 1 0 !important;
     }
 
-    /* Tabs — scrollable on narrow screens */
+    /* ── Container ── */
+    .gradio-container {
+        max-width: 100% !important;
+        padding: 0 8px 80px !important;
+        margin: 0 !important;
+        border: none !important;
+        box-shadow: none !important;
+        background: #1e1e1e !important;
+    }
+
+    /* ── Sticky header ── */
+    .ext-header {
+        position: sticky !important;
+        top: 0 !important;
+        z-index: 100 !important;
+        margin: 0 -8px 8px !important;
+        padding: 12px 14px !important;
+        backdrop-filter: blur(10px) !important;
+        -webkit-backdrop-filter: blur(10px) !important;
+        background: linear-gradient(135deg, rgba(26,115,232,0.95), rgba(21,88,176,0.95)) !important;
+    }
+    .ext-header h3 { font-size: 16px !important; }
+    .ext-header p { font-size: 11px !important; }
+
+    /* ── Rows — force stack vertically on mobile ── */
+    .gradio-container .row,
+    .gradio-container .gr-row,
+    .gradio-container [class*="row"],
+    .gradio-container .flex-row,
+    .gradio-container div[style*="flex-direction: row"],
+    .gradio-container .form > div:has(> div + div) {
+        flex-direction: column !important;
+        flex-wrap: wrap !important;
+        gap: 6px !important;
+        align-items: stretch !important;
+    }
+    .gradio-container .row > *,
+    .gradio-container .gr-row > *,
+    .gradio-container [class*="row"] > * {
+        min-width: 100% !important;
+        max-width: 100% !important;
+        flex: 1 1 100% !important;
+        width: 100% !important;
+    }
+
+    /* ── Columns — stack ── */
+    .gradio-container .column,
+    .gradio-container .gr-column,
+    .gradio-container [class*="column"] {
+        min-width: 100% !important;
+        width: 100% !important;
+    }
+
+    /* ── Tabs — horizontal scroll, pill style ── */
     .ext-tabs > .tab-nav {
         overflow-x: auto !important;
-        margin: 0 -6px 6px !important;
+        margin: 0 -8px 8px !important;
+        padding: 0 8px !important;
         -webkit-overflow-scrolling: touch;
+        scrollbar-width: none;
+        background: #252525 !important;
+        position: sticky !important;
+        top: 44px !important;
+        z-index: 99 !important;
     }
+    .ext-tabs > .tab-nav::-webkit-scrollbar { display: none; }
     .ext-tabs > .tab-nav button {
-        padding: 8px 10px !important;
-        font-size: 11px !important;
+        padding: 10px 14px !important;
+        font-size: 12px !important;
         white-space: nowrap !important;
+        flex-shrink: 0 !important;
     }
 
-    /* Buttons — larger tap targets */
+    /* ── Buttons — 44px min touch target (Apple HIG) ── */
     .ext-generate-btn {
-        padding: 12px 0 !important;
-        font-size: 14px !important;
-        margin-top: 6px !important;
+        padding: 14px 0 !important;
+        font-size: 15px !important;
+        margin-top: 8px !important;
+        border-radius: 10px !important;
     }
     .ext-refresh-btn {
-        height: 40px !important;
+        height: 44px !important;
         min-width: 44px !important;
-        font-size: 16px !important;
+        font-size: 18px !important;
+        border-radius: 8px !important;
     }
-    button[variant="stop"] {
-        min-height: 40px !important;
-    }
-
-    /* Inputs — taller for touch */
-    .gradio-container input[type="text"],
-    .gradio-container select,
-    .gradio-container .wrap input {
-        height: 40px !important;
-        font-size: 14px !important;
-        padding: 8px 10px !important;
-    }
-    .gradio-container input[type="number"] {
-        height: 40px !important;
-        width: 80px !important;
-        font-size: 14px !important;
-    }
-
-    /* Dropdowns — taller */
-    .gradio-container .wrap.svelte-aqlk7e,
-    .gradio-container .wrap[data-testid] {
-        min-height: 40px !important;
-        max-height: 40px !important;
-    }
-    .ext-site-tags .wrap.svelte-aqlk7e,
-    .ext-site-tags .wrap[data-testid] {
-        max-height: 120px !important;
+    button {
         min-height: 44px !important;
     }
 
-    /* Radio/checkbox — bigger touch targets */
+    /* ── Inputs — 44px for touch ── */
+    .gradio-container input[type="text"],
+    .gradio-container select,
+    .gradio-container .wrap input {
+        height: 44px !important;
+        font-size: 16px !important;  /* prevents iOS zoom on focus */
+        padding: 8px 12px !important;
+        border-radius: 8px !important;
+    }
+    .gradio-container input[type="number"] {
+        height: 44px !important;
+        width: 100% !important;
+        font-size: 16px !important;
+        border-radius: 8px !important;
+    }
+
+    /* ── Textareas ── */
+    .gradio-container textarea {
+        font-size: 14px !important;
+        border-radius: 8px !important;
+    }
+
+    /* ── Dropdowns — taller ── */
+    .gradio-container .wrap.svelte-aqlk7e,
+    .gradio-container .wrap[data-testid] {
+        min-height: 44px !important;
+        max-height: 44px !important;
+        border-radius: 8px !important;
+    }
+    .ext-site-tags .wrap.svelte-aqlk7e,
+    .ext-site-tags .wrap[data-testid] {
+        max-height: 140px !important;
+        min-height: 48px !important;
+    }
+
+    /* ── Radio/checkbox — larger touch ── */
     .gradio-container input[type="radio"],
     .gradio-container input[type="checkbox"] {
-        width: 20px !important;
-        height: 20px !important;
-        min-width: 20px !important;
+        width: 22px !important;
+        height: 22px !important;
+        min-width: 22px !important;
     }
     .gradio-container label:has(input[type="checkbox"]),
     .gradio-container label:has(input[type="radio"]) {
-        padding: 6px 10px !important;
-        gap: 8px !important;
+        padding: 8px 12px !important;
+        gap: 10px !important;
     }
     .gradio-container label:has(input[type="checkbox"]) span,
     .gradio-container label:has(input[type="radio"]) span {
-        font-size: 13px !important;
+        font-size: 14px !important;
     }
 
-    /* Labels */
+    /* ── Labels ── */
     .gradio-container label,
     .gradio-container .label-wrap,
     .gradio-container .gradio-label,
@@ -2565,50 +2701,96 @@ footer { display: none !important; }
         font-size: 11px !important;
     }
 
-    /* Accordion — more padding for touch */
+    /* ── Accordion — card style ── */
+    .ext-accordion {
+        border-radius: 10px !important;
+        margin: 6px 0 !important;
+    }
     .ext-accordion > .label-wrap {
-        padding: 10px 12px !important;
+        padding: 12px 14px !important;
     }
     .ext-accordion > .label-wrap span {
-        font-size: 12px !important;
+        font-size: 13px !important;
     }
     .ext-accordion > div:not(.label-wrap) {
-        padding: 6px 10px 10px !important;
+        padding: 8px 12px 12px !important;
     }
 
-    /* Site tags — larger for touch */
+    /* ── Site tags ── */
     .ext-site-tags .token {
-        padding: 4px 12px !important;
-        font-size: 12px !important;
-        margin: 3px !important;
+        padding: 4px 10px !important;
+        font-size: 11px !important;
+        margin: 2px !important;
+        border-radius: 14px !important;
+        max-width: 85vw !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
     }
 
-    /* Progress/summary textareas — more lines visible */
+    /* ── Progress/summary ── */
     .ext-progress textarea,
     .ext-summary textarea {
-        font-size: 11px !important;
+        font-size: 12px !important;
+        border-radius: 8px !important;
     }
 
-    /* File download area */
+    /* ── File download ── */
     .gradio-container a[download] {
-        font-size: 13px !important;
-        padding: 6px 0 !important;
+        font-size: 14px !important;
+        padding: 8px 0 !important;
     }
+
+    /* ── Section divider ── */
+    .ext-section {
+        margin: 10px 0 8px !important;
+    }
+
+    /* ── Dataframe / table — constrain to viewport ── */
+    table, .table-wrap, .dataframe, [class*="dataframe"] {
+        display: block !important;
+        overflow-x: auto !important;
+        max-width: 100% !important;
+        -webkit-overflow-scrolling: touch;
+    }
+    /* Hide Path column (6th col) — not useful on mobile */
+    table th:nth-child(6),
+    table td:nth-child(6) {
+        display: none !important;
+    }
+    /* Truncate filename column */
+    table td:nth-child(2) {
+        max-width: 40vw !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+    }
+    table td, table th {
+        font-size: 11px !important;
+        padding: 4px 6px !important;
+    }
+
+    /* ── Hide Gradio branding/extra chrome ── */
+    .built-with { display: none !important; }
+    .gradio-container > .flex > .flex:empty { display: none !important; }
 }
 
-/* ── Extra small screens (≤480px) ── */
+/* ── Extra small (≤480px) ── */
 @media (max-width: 480px) {
-    .ext-header h3 { font-size: 14px !important; }
+    .ext-header h3 { font-size: 15px !important; }
     .ext-header p { font-size: 10px !important; }
 
     .ext-tabs > .tab-nav button {
-        padding: 6px 8px !important;
-        font-size: 10.5px !important;
+        padding: 8px 10px !important;
+        font-size: 11px !important;
     }
 
     .gradio-container label,
     .gradio-container label span {
-        font-size: 9.5px !important;
+        font-size: 10px !important;
+    }
+
+    .gradio-container {
+        padding: 0 1px 80px !important;
     }
 }
 """
@@ -2633,6 +2815,41 @@ else:
 
 progress_js = """
 () => {
+    // Inject viewport meta for mobile
+    if (!document.querySelector('meta[name="viewport"]')) {
+        const vp = document.createElement('meta');
+        vp.name = 'viewport';
+        vp.content = 'width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes';
+        document.head.appendChild(vp);
+    }
+    // PWA meta tags
+    ['apple-mobile-web-app-capable', 'mobile-web-app-capable'].forEach(n => {
+        if (!document.querySelector(`meta[name="${n}"]`)) {
+            const m = document.createElement('meta');
+            m.name = n; m.content = 'yes';
+            document.head.appendChild(m);
+        }
+    });
+    if (!document.querySelector('meta[name="theme-color"]')) {
+        const tc = document.createElement('meta');
+        tc.name = 'theme-color'; tc.content = '#1a1a1a';
+        document.head.appendChild(tc);
+    }
+
+    // Mobile: strip Gradio wrapper padding and lock width
+    if (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
+        const lockStyle = document.createElement('style');
+        lockStyle.textContent = `
+            body > div, body > div > div, body > div > div > div {
+                padding: 0 !important;
+                margin: 0 !important;
+                overflow-x: hidden !important;
+            }
+            table { display: block; overflow-x: auto; }
+        `;
+        document.head.appendChild(lockStyle);
+    }
+
     const observer = new MutationObserver(() => {
         // Progress bar pulse
         document.querySelectorAll('.ext-progress textarea').forEach(ta => {
@@ -2674,7 +2891,7 @@ mobile_head = """
 <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>">
 """
 
-with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress_js, head=mobile_head) as app:
+with gr.Blocks(title="Web AI Tool") as app:
     gr.HTML("""
         <div class="ext-header">
             <h3>🌐 Web AI Tool</h3>
@@ -2696,14 +2913,12 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
             scale=3,
             interactive=(_saved_provider == "Custom"),
         )
-        model_input = gr.Dropdown(
-            choices=available_models,
-            value=default_model,
-            label="Model",
-            allow_custom_value=True,
-            scale=3,
-        )
-        refresh_btn = gr.Button("↻", elem_classes=["ext-refresh-btn"], scale=1, min_width=40)
+    model_input = gr.Dropdown(
+        choices=available_models,
+        value=default_model,
+        label="Model",
+        allow_custom_value=True,
+    )
 
     categories = load_categories()
     cat_names = list(categories.keys())
@@ -2825,22 +3040,24 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
 
     # ── Output Files Table ──
     gr.HTML('<div class="ext-section"></div>')
-    gr.HTML('<h3 style="margin:0.5em 0 0.2em 0;">📁 Output Files</h3>')
-    with gr.Row():
-        output_refresh_btn = gr.Button("Refresh", scale=1, min_width=80)
-        output_open_btn = gr.Button("Open Selected", scale=1, min_width=120)
-        output_delete_btn = gr.Button("Delete Selected", variant="stop", scale=1, min_width=120)
-    output_table = gr.Dataframe(
-        headers=["", "Filename", "Type", "Size", "Date", "Path"],
-        datatype=["bool", "str", "str", "str", "str", "str"],
-        col_count=(6, "fixed"),
-        value=list_output_files(),
-        interactive=True,
-        column_widths=["40px", "40%", "8%", "10%", "15%", "27%"],
-        wrap=True,
-    )
-    output_status = gr.HTML("")
-    output_download = gr.File(label="Download", visible=False)
+    with gr.Group(elem_classes=["ext-output-panel"]):
+        gr.HTML('<div class="ext-output-header">📁 Output Files</div>')
+        output_table = gr.Dataframe(
+            headers=["", "Filename", "Type", "Size", "Date", "Path"],
+            datatype=["bool", "str", "str", "str", "str", "str"],
+            col_count=(6, "fixed"),
+            value=list_output_files(),
+            interactive=True,
+            column_widths=["40px", "40%", "8%", "10%", "15%", "27%"],
+            wrap=True,
+        )
+        # Action bar — appears when files are selected
+        output_status = gr.HTML("")
+        with gr.Row(elem_classes=["ext-action-bar"], visible=False) as output_actions:
+            output_download_btn = gr.Button("📥 Download", scale=1)
+            output_open_btn = gr.Button("📂 Open", scale=1)
+            output_delete_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
+        output_download = gr.File(label="Download", visible=False)
 
     # ── Live sync timer — polls shared progress so all clients stay updated ──
     sync_timer = gr.Timer(2)  # poll every 2 seconds
@@ -2867,6 +3084,9 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         inputs=[_last_poll_version],
         outputs=[research_log, research_kw, research_out, pick_log, log_output, _last_poll_version],
     )
+
+    # ── Model auto-refresh timer (bound after handlers defined) ──
+    model_timer = gr.Timer(30)
 
     # ── Event handlers ──
     def on_provider_change(provider_name):
@@ -2903,14 +3123,32 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         status = f"{len(models)} models" if models else "not connected"
         return gr.update(choices=choices, value=default, label=f"Model ({status})")
 
+    _last_known_models = {"list": []}
+
     def refresh_models():
+        """Full refresh — resets selection to best default."""
         models = get_available_models()
         has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in models)
         has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in models)
         choices = (["auto"] if has_ext and has_ref else []) + models
         default = "auto" if has_ext and has_ref else pick_default_model(models)
         status = f"{len(models)} models" if models else "not connected"
+        _last_known_models["list"] = choices
         return gr.update(choices=choices, value=default, label=f"Model ({status})")
+
+    def poll_models(current_model):
+        """Periodic check — only update choices if models changed, preserve selection."""
+        models = get_available_models()
+        has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in models)
+        has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in models)
+        choices = (["auto"] if has_ext and has_ref else []) + models
+        if choices == _last_known_models["list"]:
+            return gr.update()  # no change
+        _last_known_models["list"] = choices
+        status = f"{len(models)} models" if models else "not connected"
+        # Keep current selection if still valid
+        value = current_model if current_model in choices else (choices[0] if choices else "")
+        return gr.update(choices=choices, value=value, label=f"Model ({status})")
 
     def on_load_cookies(browser, site_urls):
         # Support both list (multiselect) and string
@@ -3035,7 +3273,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
 
     provider_input.change(on_provider_change, inputs=[provider_input], outputs=[provider_url, model_input])
     provider_url.submit(on_provider_url_change, inputs=[provider_url], outputs=[model_input])
-    refresh_btn.click(refresh_models, outputs=[model_input])
+    model_timer.tick(poll_models, inputs=[model_input], outputs=[model_input])
     site_category.change(on_category_change, inputs=[site_category, site_category_all], outputs=[research_site])
     site_category_all.change(on_all_categories_toggle, inputs=[site_category_all, site_category], outputs=[research_site])
     research_site.change(on_sites_change, inputs=[research_site])
@@ -3279,22 +3517,32 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                 selected.append(row[5])  # path column
         return selected
 
-    def _open_selected(table_data):
+    def _download_selected(table_data):
+        """Return selected files for browser download (works on mobile/remote)."""
         paths = _get_selected_paths(table_data)
         if not paths:
             return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>', gr.update(visible=False, value=None)
-        # Return files for download (works over VPN), also try local open
         existing = [p for p in paths if os.path.exists(p)]
         if not existing:
             return gr.update(value=list_output_files()), '<span style="color:#e74c3c">❌ Selected files not found</span>', gr.update(visible=False, value=None)
+        names = ", ".join(os.path.basename(p) for p in existing)
+        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Ready to download: {names}</span>', gr.update(visible=True, value=existing if len(existing) > 1 else existing[0])
+
+    def _open_selected(table_data):
+        """Open selected files locally on the Mac."""
+        paths = _get_selected_paths(table_data)
+        if not paths:
+            return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>'
+        existing = [p for p in paths if os.path.exists(p)]
+        if not existing:
+            return gr.update(value=list_output_files()), '<span style="color:#e74c3c">❌ Selected files not found</span>'
         for p in existing:
             try:
                 subprocess.Popen(["open", p])
             except Exception:
                 pass
-        if len(existing) == 1:
-            return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Opened {os.path.basename(existing[0])}</span>', gr.update(visible=True, value=existing[0])
-        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Opened {len(existing)} files</span>', gr.update(visible=True, value=existing)
+        names = ", ".join(os.path.basename(p) for p in existing)
+        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Opened on Mac: {names}</span>'
 
     def _delete_selected(table_data):
         paths = _get_selected_paths(table_data)
@@ -3310,9 +3558,31 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                 pass
         return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Deleted {deleted} file(s)</span>'
 
-    output_refresh_btn.click(_refresh_output_table, outputs=[output_table, output_status])
-    output_open_btn.click(_open_selected, inputs=[output_table], outputs=[output_table, output_status, output_download])
-    output_delete_btn.click(_delete_selected, inputs=[output_table], outputs=[output_table, output_status])
+    def _on_table_select(table_data):
+        """Show/hide action bar based on whether any rows are checked."""
+        paths = _get_selected_paths(table_data)
+        if paths:
+            count = len(paths)
+            label = f'<span style="color:#64b5f6;font-size:12px;">{count} file{"s" if count > 1 else ""} selected</span>'
+            return gr.update(value=label), gr.update(visible=True)
+        return gr.update(value=""), gr.update(visible=False)
+
+    output_table.change(_on_table_select, inputs=[output_table], outputs=[output_status, output_actions])
+    def _download_and_hide(table_data):
+        tbl, status, dl = _download_selected(table_data)
+        return tbl, status, dl, gr.update(visible=False)
+
+    def _open_and_hide(table_data):
+        tbl, status = _open_selected(table_data)
+        return tbl, status, gr.update(visible=False)
+
+    def _delete_and_hide(table_data):
+        tbl, status = _delete_selected(table_data)
+        return tbl, status, gr.update(visible=False)
+
+    output_download_btn.click(_download_and_hide, inputs=[output_table], outputs=[output_table, output_status, output_download, output_actions])
+    output_open_btn.click(_open_and_hide, inputs=[output_table], outputs=[output_table, output_status, output_actions])
+    output_delete_btn.click(_delete_and_hide, inputs=[output_table], outputs=[output_table, output_status, output_actions])
 
     # Auto-refresh table after any pipeline completes
     research_event.then(_refresh_output_table, outputs=[output_table, output_status])
@@ -3320,4 +3590,13 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
     keynote_event.then(_refresh_output_table, outputs=[output_table, output_status])
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860, share=False, allowed_paths=[OUTPUT_DIR])
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        allowed_paths=[OUTPUT_DIR],
+        theme=gr.themes.Soft(),
+        css=css,
+        js=progress_js,
+        head=mobile_head,
+    )
