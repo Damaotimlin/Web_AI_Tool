@@ -40,6 +40,51 @@ class StopFlag:
         if self._event.is_set():
             raise GeneratorExit("Stopped by user")
 
+
+class SharedProgress:
+    """Thread-safe shared progress visible to all connected clients via polling."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = {
+            "research_log": "", "research_kw": "", "research_out": "",
+            "pick_log": "", "keynote_log": "",
+            "running": None,  # "research" | "pick" | "keynote" | None
+        }
+        self._version = 0  # bumped on every update so poll can detect changes
+
+    def update(self, **kwargs):
+        with self._lock:
+            self._state.update(kwargs)
+            self._version += 1
+
+    def get(self, key, default=""):
+        with self._lock:
+            return self._state.get(key, default)
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._state), self._version
+
+    def clear(self, pipeline: str):
+        """Clear progress for a pipeline about to start."""
+        with self._lock:
+            if pipeline == "research":
+                self._state.update(research_log="", research_kw="", research_out="", pick_log="")
+            elif pipeline == "pick":
+                self._state.update(pick_log="")
+            elif pipeline == "keynote":
+                self._state.update(keynote_log="")
+            self._state["running"] = pipeline
+            self._version += 1
+
+    def finish(self):
+        with self._lock:
+            self._state["running"] = None
+            self._version += 1
+
+
+_progress = SharedProgress()
+
 # AI provider presets: name → (base_url, description)
 AI_PROVIDERS = {
     "LM Studio":       ("http://localhost:1234",  "LM Studio default"),
@@ -614,9 +659,9 @@ def chat(prompt: str, model: str = "") -> str:
         raise ValueError(f"AI provider error: {e}")
 
 
-def translate_content(content: str, language: str, model: str = "", user_prompt: str = "") -> str:
+def translate_content(content: str, language: str, model: str = "", user_prompt: str = "", lang2: str = "") -> str:
     """Translate and summarize content."""
-    return chat(get_prompts().translate_and_summarize(content, language, user_prompt), model)
+    return chat(get_prompts().translate_and_summarize(content, language, user_prompt, lang2), model)
 
 
 def _build_slide_prompt(content: str, language: str, num_slides: int, lang2: str = "", user_instruction: str = "", slide_context: str = "") -> str:
@@ -1946,7 +1991,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         yield "\n".join(logs), None, ""
 
         try:
-            summary = translate_content(content, lang1, ref_model, user_prompt=user_prompt)
+            summary = translate_content(content, lang1, ref_model, user_prompt=user_prompt, lang2=lang2)
             logs.append("✅ Translation done")
         except Exception as e:
             issues.append(f"Translation error: {e}")
@@ -2036,6 +2081,30 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         yield "\n".join(logs), None, ""
 
 
+def list_output_files() -> list[list]:
+    """Return rows for the output files table: [selected, filename, type, size, date, path]."""
+    rows = []
+    if not os.path.isdir(OUTPUT_DIR):
+        return rows
+    for fname in sorted(os.listdir(OUTPUT_DIR), key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)), reverse=True):
+        fpath = os.path.join(OUTPUT_DIR, fname)
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(fname)[1].lower()
+        if ext not in (".pptx", ".pdf"):
+            continue
+        size_bytes = os.path.getsize(fpath)
+        if size_bytes < 1024:
+            size_str = f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            size_str = f"{size_bytes / 1024:.1f} KB"
+        else:
+            size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
+        mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M")
+        rows.append([False, fname, ext.lstrip(".").upper(), size_str, mtime, fpath])
+    return rows
+
+
 # --- UI ---
 css = """
 /* === Web AI Tool — compact dark === */
@@ -2116,7 +2185,6 @@ body {
 
 /* ── Inputs — consistent 34px height ── */
 .gradio-container input[type="text"],
-.gradio-container textarea,
 .gradio-container select,
 .gradio-container .wrap input {
     background: #333 !important;
@@ -2128,7 +2196,6 @@ body {
     height: 34px !important;
     transition: border-color 0.15s;
 }
-.gradio-container textarea { height: auto !important; }
 .gradio-container .secondary-wrap {
     background: #333 !important;
     border: 1px solid #444 !important;
@@ -2137,8 +2204,7 @@ body {
     font-size: 12.5px !important;
     padding: 4px 8px !important;
 }
-.gradio-container input[type="text"]:focus,
-.gradio-container textarea:focus {
+.gradio-container input[type="text"]:focus {
     border-color: #1a73e8 !important;
     outline: none !important;
     box-shadow: 0 0 0 2px rgba(26,115,232,0.2) !important;
@@ -2384,6 +2450,167 @@ body {
 
 /* ── Hide footer ── */
 footer { display: none !important; }
+
+/* ══════════════════════════════════════════════
+   Mobile / responsive (≤768px)
+   ══════════════════════════════════════════════ */
+@media (max-width: 768px) {
+    /* Container — full width, less padding */
+    .gradio-container {
+        max-width: 100% !important;
+        padding: 0 6px 8px !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+
+    /* Header */
+    .ext-header {
+        margin: 0 -6px 8px !important;
+        padding: 10px 12px !important;
+    }
+    .ext-header h3 { font-size: 15px !important; }
+
+    /* Rows — stack vertically on mobile */
+    .gradio-container .row {
+        flex-direction: column !important;
+        gap: 4px !important;
+        align-items: stretch !important;
+    }
+    /* Let each item in a row take full width */
+    .gradio-container .row > * {
+        min-width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+
+    /* Columns — stack vertically */
+    .gradio-container .column {
+        min-width: 100% !important;
+    }
+
+    /* Tabs — scrollable on narrow screens */
+    .ext-tabs > .tab-nav {
+        overflow-x: auto !important;
+        margin: 0 -6px 6px !important;
+        -webkit-overflow-scrolling: touch;
+    }
+    .ext-tabs > .tab-nav button {
+        padding: 8px 10px !important;
+        font-size: 11px !important;
+        white-space: nowrap !important;
+    }
+
+    /* Buttons — larger tap targets */
+    .ext-generate-btn {
+        padding: 12px 0 !important;
+        font-size: 14px !important;
+        margin-top: 6px !important;
+    }
+    .ext-refresh-btn {
+        height: 40px !important;
+        min-width: 44px !important;
+        font-size: 16px !important;
+    }
+    button[variant="stop"] {
+        min-height: 40px !important;
+    }
+
+    /* Inputs — taller for touch */
+    .gradio-container input[type="text"],
+    .gradio-container select,
+    .gradio-container .wrap input {
+        height: 40px !important;
+        font-size: 14px !important;
+        padding: 8px 10px !important;
+    }
+    .gradio-container input[type="number"] {
+        height: 40px !important;
+        width: 80px !important;
+        font-size: 14px !important;
+    }
+
+    /* Dropdowns — taller */
+    .gradio-container .wrap.svelte-aqlk7e,
+    .gradio-container .wrap[data-testid] {
+        min-height: 40px !important;
+        max-height: 40px !important;
+    }
+    .ext-site-tags .wrap.svelte-aqlk7e,
+    .ext-site-tags .wrap[data-testid] {
+        max-height: 120px !important;
+        min-height: 44px !important;
+    }
+
+    /* Radio/checkbox — bigger touch targets */
+    .gradio-container input[type="radio"],
+    .gradio-container input[type="checkbox"] {
+        width: 20px !important;
+        height: 20px !important;
+        min-width: 20px !important;
+    }
+    .gradio-container label:has(input[type="checkbox"]),
+    .gradio-container label:has(input[type="radio"]) {
+        padding: 6px 10px !important;
+        gap: 8px !important;
+    }
+    .gradio-container label:has(input[type="checkbox"]) span,
+    .gradio-container label:has(input[type="radio"]) span {
+        font-size: 13px !important;
+    }
+
+    /* Labels */
+    .gradio-container label,
+    .gradio-container .label-wrap,
+    .gradio-container .gradio-label,
+    .gradio-container label span {
+        font-size: 11px !important;
+    }
+
+    /* Accordion — more padding for touch */
+    .ext-accordion > .label-wrap {
+        padding: 10px 12px !important;
+    }
+    .ext-accordion > .label-wrap span {
+        font-size: 12px !important;
+    }
+    .ext-accordion > div:not(.label-wrap) {
+        padding: 6px 10px 10px !important;
+    }
+
+    /* Site tags — larger for touch */
+    .ext-site-tags .token {
+        padding: 4px 12px !important;
+        font-size: 12px !important;
+        margin: 3px !important;
+    }
+
+    /* Progress/summary textareas — more lines visible */
+    .ext-progress textarea,
+    .ext-summary textarea {
+        font-size: 11px !important;
+    }
+
+    /* File download area */
+    .gradio-container a[download] {
+        font-size: 13px !important;
+        padding: 6px 0 !important;
+    }
+}
+
+/* ── Extra small screens (≤480px) ── */
+@media (max-width: 480px) {
+    .ext-header h3 { font-size: 14px !important; }
+    .ext-header p { font-size: 10px !important; }
+
+    .ext-tabs > .tab-nav button {
+        padding: 6px 8px !important;
+        font-size: 10.5px !important;
+    }
+
+    .gradio-container label,
+    .gradio-container label span {
+        font-size: 9.5px !important;
+    }
+}
 """
 
 # Load saved provider preference
@@ -2438,7 +2665,16 @@ progress_js = """
 }
 """
 
-with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress_js) as app:
+mobile_head = """
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1a1a1a">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌐</text></svg>">
+"""
+
+with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress_js, head=mobile_head) as app:
     gr.HTML("""
         <div class="ext-header">
             <h3>🌐 Web AI Tool</h3>
@@ -2586,6 +2822,51 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                     log_output     = gr.Textbox(label="Progress", lines=6, interactive=False, elem_classes=["ext-progress"])
                     file_output    = gr.File(label="Download")
                     summary_output = gr.Textbox(label="Summary", lines=5, interactive=False, elem_classes=["ext-summary"])
+
+    # ── Output Files Table ──
+    gr.HTML('<div class="ext-section"></div>')
+    gr.HTML('<h3 style="margin:0.5em 0 0.2em 0;">📁 Output Files</h3>')
+    with gr.Row():
+        output_refresh_btn = gr.Button("Refresh", scale=1, min_width=80)
+        output_open_btn = gr.Button("Open Selected", scale=1, min_width=120)
+        output_delete_btn = gr.Button("Delete Selected", variant="stop", scale=1, min_width=120)
+    output_table = gr.Dataframe(
+        headers=["", "Filename", "Type", "Size", "Date", "Path"],
+        datatype=["bool", "str", "str", "str", "str", "str"],
+        col_count=(6, "fixed"),
+        value=list_output_files(),
+        interactive=True,
+        column_widths=["40px", "40%", "8%", "10%", "15%", "27%"],
+        wrap=True,
+    )
+    output_status = gr.HTML("")
+    output_download = gr.File(label="Download", visible=False)
+
+    # ── Live sync timer — polls shared progress so all clients stay updated ──
+    sync_timer = gr.Timer(2)  # poll every 2 seconds
+    _last_poll_version = gr.State(0)
+
+    def _poll_progress(last_ver):
+        """Return current progress if changed, otherwise skip update."""
+        state, ver = _progress.snapshot()
+        if ver == last_ver:
+            # No change — return no_update for everything to avoid flicker
+            return (gr.update(), gr.update(), gr.update(),
+                    gr.update(), gr.update(), ver)
+        running = state.get("running")
+        # Only push fields relevant to the active pipeline
+        r_log = gr.update(value=state["research_log"]) if state["research_log"] else gr.update()
+        r_kw = gr.update(value=state["research_kw"]) if state["research_kw"] else gr.update()
+        r_out = gr.update(value=state["research_out"]) if state["research_out"] else gr.update()
+        p_log = gr.update(value=state["pick_log"]) if state["pick_log"] else gr.update()
+        k_log = gr.update(value=state["keynote_log"]) if state["keynote_log"] else gr.update()
+        return r_log, r_kw, r_out, p_log, k_log, ver
+
+    sync_timer.tick(
+        _poll_progress,
+        inputs=[_last_poll_version],
+        outputs=[research_log, research_kw, research_out, pick_log, log_output, _last_poll_version],
+    )
 
     # ── Event handlers ──
     def on_provider_change(provider_name):
@@ -2773,6 +3054,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         global _active_stop_flag
         sf = StopFlag()
         _active_stop_flag = sf
+        _progress.clear("research")
 
         # Save preferences
         is_deep = depth == "Deep"
@@ -2794,23 +3076,29 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                 last_kw = res_kw
                 last_out = res_out
                 last_picker = picker_update
+                _progress.update(research_log=res_log, research_kw=res_kw, research_out=res_out)
                 # Capture the top selection from the final picker update
                 if isinstance(picker_update, dict) and picker_update.get("value"):
                     top_selection = picker_update["value"]
                 yield res_log, res_kw, res_out, picker_update, no_kn, no_kn, no_kn
         except GeneratorExit:
             last_res_log += "\n\n🛑 Stopped by user"
+            _progress.update(research_log=last_res_log)
+            _progress.finish()
             yield last_res_log, last_kw, last_out, last_picker, no_kn, no_kn, no_kn
             return
         finally:
             _active_stop_flag = None
 
         if not auto_gen:
+            _progress.finish()
             return
 
         # Auto-generate from top article
         if not top_selection or "|" not in top_selection:
             last_res_log += "\n\n⚠️ Auto-generate: no article found to generate from"
+            _progress.update(research_log=last_res_log)
+            _progress.finish()
             yield last_res_log, last_kw, last_out, last_picker, "⚠️ No article to generate from", no_kn, no_kn
             return
 
@@ -2819,6 +3107,8 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         title = top_selection[:last_pipe].strip()
         if not url.startswith("http"):
             last_res_log += f"\n\n⚠️ Auto-generate: invalid URL extracted: {url}"
+            _progress.update(research_log=last_res_log)
+            _progress.finish()
             yield last_res_log, last_kw, last_out, last_picker, f"⚠️ Invalid URL: {url}", no_kn, no_kn
             return
 
@@ -2850,11 +3140,16 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         # Show transition in both logs
         combine_msg = f" + {len(extra_urls)} related" if extra_urls else ""
         last_res_log += f"\n\n🚀 Auto-generating Keynote from: {title[:60]}{combine_msg}..."
-        yield last_res_log, last_kw, last_out, last_picker, f"🚀 Starting Keynote generation...\n📎 {title[:70]}{combine_msg}\n🔗 {url}", no_kn, no_kn
+        pick_msg = f"🚀 Starting Keynote generation...\n📎 {title[:70]}{combine_msg}\n🔗 {url}"
+        _progress.update(research_log=last_res_log, pick_log=pick_msg)
+        yield last_res_log, last_kw, last_out, last_picker, pick_msg, no_kn, no_kn
 
         for kn_log, kn_file, kn_summary in run_pipeline(url, l1, l2, num, thm, True, model, cookies, user_prompt=prompt, extra_urls=extra_urls, stop_flag=sf):
             sf.check()
+            _progress.update(pick_log=kn_log)
             yield last_res_log, last_kw, last_out, last_picker, kn_log, kn_file, kn_summary
+
+        _progress.finish()
 
     research_event = research_btn.click(
         lambda: gr.update(interactive=True),
@@ -2887,22 +3182,29 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         global _active_stop_flag
         sf = StopFlag()
         _active_stop_flag = sf
+        _progress.clear("pick")
         try:
             if not selection or "|" not in selection:
                 yield "❌ No article selected — run Research first", None, ""
+                _progress.finish()
                 return
             last_pipe = selection.rfind("|")
             url = selection[last_pipe + 1:].strip()
             if not url.startswith("http"):
                 yield f"❌ Invalid URL: {url}", None, ""
+                _progress.finish()
                 return
-            yield from run_pipeline(url, l1, l2, int(slides), thm, True, mdl, cookies, user_prompt=prompt, stop_flag=sf)
+            for log, fobj, summary in run_pipeline(url, l1, l2, int(slides), thm, True, mdl, cookies, user_prompt=prompt, stop_flag=sf):
+                _progress.update(pick_log=log)
+                yield log, fobj, summary
         except GeneratorExit:
+            _progress.update(pick_log="🛑 Stopped by user")
             yield "🛑 Stopped by user", None, ""
         except Exception as e:
             yield f"❌ Error: {e}", None, ""
         finally:
             _active_stop_flag = None
+            _progress.finish()
 
     pick_event = generate_from_research.click(
         lambda: gr.update(interactive=True),
@@ -2929,13 +3231,18 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         global _active_stop_flag
         sf = StopFlag()
         _active_stop_flag = sf
+        _progress.clear("keynote")
         save_prefs(slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm)
         try:
-            yield from run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies, stop_flag=sf)
+            for log, fobj, summary in run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies, stop_flag=sf):
+                _progress.update(keynote_log=log)
+                yield log, fobj, summary
         except GeneratorExit:
+            _progress.update(keynote_log="🛑 Stopped by user")
             yield "🛑 Stopped by user", None, ""
         finally:
             _active_stop_flag = None
+            _progress.finish()
 
     keynote_event = btn.click(
         lambda: gr.update(interactive=True),
@@ -2958,5 +3265,59 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         cancels=[keynote_event],
     )
 
+    # ── Output Files Table handlers ──
+    def _refresh_output_table():
+        return gr.update(value=list_output_files()), ""
+
+    def _get_selected_paths(table_data):
+        """Extract file paths from selected (checked) rows."""
+        selected = []
+        if table_data is None:
+            return selected
+        for row in table_data.values.tolist() if hasattr(table_data, 'values') else table_data:
+            if row[0]:  # checkbox column
+                selected.append(row[5])  # path column
+        return selected
+
+    def _open_selected(table_data):
+        paths = _get_selected_paths(table_data)
+        if not paths:
+            return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>', gr.update(visible=False, value=None)
+        # Return files for download (works over VPN), also try local open
+        existing = [p for p in paths if os.path.exists(p)]
+        if not existing:
+            return gr.update(value=list_output_files()), '<span style="color:#e74c3c">❌ Selected files not found</span>', gr.update(visible=False, value=None)
+        for p in existing:
+            try:
+                subprocess.Popen(["open", p])
+            except Exception:
+                pass
+        if len(existing) == 1:
+            return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Opened {os.path.basename(existing[0])}</span>', gr.update(visible=True, value=existing[0])
+        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Opened {len(existing)} files</span>', gr.update(visible=True, value=existing)
+
+    def _delete_selected(table_data):
+        paths = _get_selected_paths(table_data)
+        if not paths:
+            return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>'
+        deleted = 0
+        for p in paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+                    deleted += 1
+            except Exception:
+                pass
+        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Deleted {deleted} file(s)</span>'
+
+    output_refresh_btn.click(_refresh_output_table, outputs=[output_table, output_status])
+    output_open_btn.click(_open_selected, inputs=[output_table], outputs=[output_table, output_status, output_download])
+    output_delete_btn.click(_delete_selected, inputs=[output_table], outputs=[output_table, output_status])
+
+    # Auto-refresh table after any pipeline completes
+    research_event.then(_refresh_output_table, outputs=[output_table, output_status])
+    pick_event.then(_refresh_output_table, outputs=[output_table, output_status])
+    keynote_event.then(_refresh_output_table, outputs=[output_table, output_status])
+
 if __name__ == "__main__":
-    app.launch(server_port=7860, share=False)
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False, allowed_paths=[OUTPUT_DIR])

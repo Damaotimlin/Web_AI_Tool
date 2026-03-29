@@ -6,16 +6,28 @@ Each function returns a formatted prompt string.
 """
 
 
-def translate_and_summarize(content: str, language: str, user_prompt: str = "") -> str:
+def translate_and_summarize(content: str, language: str, user_prompt: str = "", lang2: str = "") -> str:
     user_instruction = ""
     if user_prompt:
         user_instruction = f"""
 The user's original research prompt was: "{user_prompt}"
 Consider this context when summarizing — focus on aspects most relevant to the user's interest.
 """
+    if lang2 and lang2 != "None":
+        dual_lang_instruction = f"""
+OUTPUT FORMAT — Dual-language summary:
+Write the summary in BOTH {language} AND {lang2}. Structure as:
+1. First, the full summary in {language} (500-800 words)
+2. Then a separator line: "---"
+3. Then the full summary in {lang2} (500-800 words)
+Both versions must cover the same key points, data, and analysis."""
+    else:
+        dual_lang_instruction = f"Write the summary in {language}."
+
     return f"""
-Translate and provide a comprehensive summary of the following content into {language}.
-The summary should be detailed and thorough (500-800 words). Cover all key points, data, quotes, and analysis.
+Provide a comprehensive summary of the following content.
+{dual_lang_instruction}
+The summary should be detailed and thorough (500-800 words per language). Cover all key points, data, quotes, and analysis.
 Do NOT be brief — include specific numbers, names, dates, and details from the article(s).
 
 CRITICAL — Fact vs. speculation labeling:
