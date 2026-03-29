@@ -14,8 +14,29 @@ from pptx.dml.color import RGBColor
 from datetime import datetime
 import prompts
 
-LM_STUDIO_BASE = "http://localhost:1234"
-LM_STUDIO_URL = f"{LM_STUDIO_BASE}/v1/chat/completions"
+# AI provider presets: name → (base_url, description)
+AI_PROVIDERS = {
+    "LM Studio":       ("http://localhost:1234",  "LM Studio default"),
+    "Ollama":           ("http://localhost:11434", "Ollama default"),
+    "LocalAI":          ("http://localhost:8080",  "LocalAI default"),
+    "vLLM":             ("http://localhost:8000",  "vLLM default"),
+    "Jan":              ("http://localhost:1337",  "Jan default"),
+    "llama.cpp":        ("http://localhost:8080",  "llama.cpp server"),
+    "Text Gen WebUI":   ("http://localhost:5000",  "oobabooga text-generation-webui"),
+    "Custom":           ("http://localhost:1234",  "Custom endpoint"),
+}
+
+# Active provider — updated at runtime from UI
+_active_provider_base = "http://localhost:1234"
+
+
+def get_provider_base() -> str:
+    return _active_provider_base
+
+
+def set_provider_base(base_url: str):
+    global _active_provider_base
+    _active_provider_base = base_url.rstrip("/")
 PREFERRED_MODELS = [
     "qwen3.5-35b-a3b",
     "qwen3.5-27b-claude-4.6-opus-reasoning-distilled",
@@ -145,9 +166,9 @@ def save_sites(sites: list[str]):
 
 
 def get_available_models() -> list[str]:
-    """Fetch available model IDs from LM Studio."""
+    """Fetch available model IDs from the active AI provider."""
     try:
-        res = requests.get(f"{LM_STUDIO_BASE}/v1/models", timeout=5)
+        res = requests.get(f"{get_provider_base()}/v1/models", timeout=5)
         res.raise_for_status()
         return [m["id"] for m in res.json().get("data", [])]
     except Exception:
@@ -552,18 +573,19 @@ def fetch_article_images(url: str, session: requests.Session | None = None, max_
 
 
 def chat(prompt: str, model: str = "") -> str:
-    """Send prompt to LM Studio and return response text."""
+    """Send prompt to AI provider and return response text."""
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
     }
     try:
-        res = requests.post(LM_STUDIO_URL, json=payload, timeout=300)
+        url = f"{get_provider_base()}/v1/chat/completions"
+        res = requests.post(url, json=payload, timeout=300)
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        raise ValueError(f"LM Studio error: {e}")
+        raise ValueError(f"AI provider error: {e}")
 
 
 def translate_content(content: str, language: str, model: str = "", user_prompt: str = "") -> str:
@@ -2300,6 +2322,15 @@ body {
 footer { display: none !important; }
 """
 
+# Load saved provider preference
+_startup_prefs = load_saved_prefs()
+_saved_provider = _startup_prefs.get("ai_provider", "LM Studio")
+_saved_custom_url = _startup_prefs.get("ai_provider_url", "")
+if _saved_provider in AI_PROVIDERS:
+    set_provider_base(AI_PROVIDERS[_saved_provider][0])
+elif _saved_custom_url:
+    set_provider_base(_saved_custom_url)
+
 available_models = get_available_models()
 _has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in available_models)
 _has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in available_models)
@@ -2351,12 +2382,24 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
 
     # Shared controls at the top
     with gr.Row():
+        provider_input = gr.Dropdown(
+            choices=list(AI_PROVIDERS.keys()),
+            value=_saved_provider,
+            label="AI Provider",
+            scale=2,
+        )
+        provider_url = gr.Textbox(
+            value=AI_PROVIDERS.get(_saved_provider, ("http://localhost:1234",))[0] if _saved_provider != "Custom" else _saved_custom_url,
+            label="Endpoint URL",
+            scale=3,
+            interactive=(_saved_provider == "Custom"),
+        )
         model_input = gr.Dropdown(
             choices=available_models,
             value=default_model,
             label="Model",
             allow_custom_value=True,
-            scale=4,
+            scale=3,
         )
         refresh_btn = gr.Button("↻", elem_classes=["ext-refresh-btn"], scale=1, min_width=40)
 
@@ -2480,14 +2523,48 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                     summary_output = gr.Textbox(label="Summary", lines=5, interactive=False, elem_classes=["ext-summary"])
 
     # ── Event handlers ──
-    def refresh_models():
+    def on_provider_change(provider_name):
+        """Switch AI provider — update URL, save preference, refresh models."""
+        if provider_name in AI_PROVIDERS:
+            base_url = AI_PROVIDERS[provider_name][0]
+            is_custom = provider_name == "Custom"
+            set_provider_base(base_url)
+            save_prefs(ai_provider=provider_name, ai_provider_url=base_url)
+            models = get_available_models()
+            has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in models)
+            has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in models)
+            choices = (["auto"] if has_ext and has_ref else []) + models
+            default = "auto" if has_ext and has_ref else pick_default_model(models)
+            status = f"{len(models)} models" if models else "not connected"
+            return (
+                gr.update(value=base_url, interactive=is_custom),
+                gr.update(choices=choices, value=default, label=f"Model ({status})"),
+            )
+        return gr.update(), gr.update()
+
+    def on_provider_url_change(url):
+        """Apply custom endpoint URL."""
+        url = (url or "").strip().rstrip("/")
+        if not url:
+            return gr.update()
+        set_provider_base(url)
+        save_prefs(ai_provider_url=url)
         models = get_available_models()
-        # If both extraction and refinement models are available, offer "auto" for 2-stage routing
         has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in models)
         has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in models)
         choices = (["auto"] if has_ext and has_ref else []) + models
         default = "auto" if has_ext and has_ref else pick_default_model(models)
-        return gr.update(choices=choices, value=default)
+        status = f"{len(models)} models" if models else "not connected"
+        return gr.update(choices=choices, value=default, label=f"Model ({status})")
+
+    def refresh_models():
+        models = get_available_models()
+        has_ext = any(EXTRACTION_MODEL_PATTERN.lower() in m.lower() for m in models)
+        has_ref = any(REFINEMENT_MODEL_PATTERN.lower() in m.lower() for m in models)
+        choices = (["auto"] if has_ext and has_ref else []) + models
+        default = "auto" if has_ext and has_ref else pick_default_model(models)
+        status = f"{len(models)} models" if models else "not connected"
+        return gr.update(choices=choices, value=default, label=f"Model ({status})")
 
     def on_load_cookies(browser, site_urls):
         # Support both list (multiselect) and string
@@ -2617,6 +2694,8 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         msg = _cat_status_html(f"✅ Saved {len(sites)} sites to \"{cat_name}\"")
         return gr.update(value=sites), msg
 
+    provider_input.change(on_provider_change, inputs=[provider_input], outputs=[provider_url, model_input])
+    provider_url.submit(on_provider_url_change, inputs=[provider_url], outputs=[model_input])
     refresh_btn.click(refresh_models, outputs=[model_input])
     site_category.change(on_category_change, inputs=[site_category, site_category_all], outputs=[research_site])
     site_category_all.change(on_all_categories_toggle, inputs=[site_category_all, site_category], outputs=[research_site])

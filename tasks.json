@@ -11,7 +11,7 @@
     {
       "label": "Run App",
       "type": "shell",
-      "command": "python src/app.py",
+      "command": "python app.py",
       "group": { "kind": "build", "isDefault": true },
       "presentation": { "reveal": "always" }
     }

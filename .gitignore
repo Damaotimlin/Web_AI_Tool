@@ -20,9 +20,14 @@ build/
 .webai.pid
 .saved_prefs.json
 .saved_sites.json
+.saved_categories.json
+.sites_history.json
 
 # Claude
 .claude/
+
+# Test utilities (contains local cookie references)
+test_cookie_sandbox.py
 
 # Outputs
 outputs/
