@@ -3538,7 +3538,11 @@ with gr.Blocks(title="Web AI Tool") as app:
     def _resolve_picked(fname):
         if not fname:
             return None
-        fpath = os.path.join(OUTPUT_DIR, fname)
+        if isinstance(fname, list):
+            fname = fname[0] if fname else None
+        if not fname:
+            return None
+        fpath = os.path.join(OUTPUT_DIR, str(fname).strip())
         return fpath if os.path.exists(fpath) else None
 
     def _download_file(fname):
