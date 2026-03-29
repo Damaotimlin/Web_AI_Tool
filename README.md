@@ -186,3 +186,103 @@ All preferences are auto-saved between sessions:
 - **Local LLM server** — any OpenAI-compatible provider (LM Studio, Ollama, vLLM, LocalAI, Jan, llama.cpp, or Text Gen WebUI)
 - **LibreOffice** (for PDF export) — `brew install --cask libreoffice`
 - **Chrome** (optional, for paywall cookie extraction)
+
+---
+
+# Web AI Tool — 繁體中文說明
+
+一款本機優先的研究與簡報工具——爬取新聞與科技網站、以 AI 篩選與評分文章、自動生成雙語 Keynote/PDF 簡報。支援任何相容 OpenAI API 的本機大型語言模型。
+
+## 功能簡介
+
+1. **智慧研究** — 輸入主題後，工具同時爬取多個新聞/科技網站，AI 自動提取關鍵字、篩選標題相關性、深度閱讀最佳文章
+2. **翻譯摘要** — 將文章內容翻譯為目標語言，產出 500-800 字的詳盡摘要
+3. **自動生成簡報** — 產出雙語簡報（如 zh-TW + English），含主題佈景、來源引用、封面圖片
+4. **匯出格式** — 自動產出 PDF（透過 LibreOffice）及 PPTX，完成後自動開啟
+
+## 支援的 AI 服務
+
+工具支援任何提供 `/v1/chat/completions` API 的本機 LLM 伺服器，在介面的「AI Provider」下拉選單中切換：
+
+| 服務 | 預設埠號 | 說明 |
+|------|---------|------|
+| LM Studio | 1234 | 設定中啟用「Local Server」 |
+| Ollama | 11434 | `ollama serve`，透過 `ollama pull` 下載模型 |
+| vLLM | 8000 | `vllm serve <模型名>` |
+| LocalAI | 8080 | Docker 或直接安裝 |
+| Jan | 1337 | 設定中啟用「Local API Server」 |
+| llama.cpp | 8080 | `llama-server -m <模型檔>` |
+| Text Gen WebUI | 5000 | oobabooga，需啟用 API 擴充 |
+| 自訂 | 任意 | 手動輸入任何 URL |
+
+選擇的服務與 URL 會自動記憶，下次啟動自動套用。
+
+## 安裝步驟
+
+```bash
+# 1. 安裝 Python 套件
+pip install -r requirements.txt
+
+# 2. 安裝 Playwright 瀏覽器（用於付費牆網站）
+python -m playwright install chromium
+
+# 3. 安裝 LibreOffice（用於 PDF 匯出）
+brew install --cask libreoffice
+
+# 4. 啟動本機 AI 服務（任選一個）
+#    例：LM Studio → 啟用 Local Server（port 1234）
+#    例：Ollama → ollama serve（port 11434）
+
+# 5. 啟動工具
+python app.py
+```
+
+開啟瀏覽器前往 http://localhost:7860
+
+## 主要功能
+
+### 研究標籤頁
+- **主題研究** — 輸入如「AI 監管對科技公司的影響」等主題
+- **多站爬取** — 同時爬取 10+ 個網站（財經、科技或自訂）
+- **AI 關鍵字提取** — 從主題產生 15-25 個搜尋關鍵字
+- **AI 標題篩選** — 批次評分文章相關性（每批 40 篇）
+- **深度閱讀** — AI 閱讀完整文章內容並評分
+- **主題分群** — 自動將相關文章依子主題分組
+
+### 網站分類管理
+- **內建分類**：財經（MarketWatch、WSJ、Barron's、Economist 等）和科技（TechCrunch、The Verge、Wired 等）
+- **自訂分類** — 透過「Manage Categories」面板新增、重新命名、刪除分類
+- **分類記憶** — 每個分類各自記憶網站選擇
+
+### 爬取深度
+
+| 模式 | 行為 | 每站連結數 | 時間 |
+|------|------|-----------|------|
+| Standard | 僅爬首頁 | ~80 連結 | ~2-5 分鐘 |
+| Deep | 追蹤符合關鍵字的分類頁面 | ~150 連結 | ~5-10 分鐘 |
+
+### 簡報標籤頁
+- **直接 URL 模式** — 貼上任何文章網址即可生成簡報
+- **雙語簡報** — 每張投影片同時顯示主要語言與次要語言
+- **3 種佈景** — 深色、淺色、藍色
+- **封面圖片** — 自動從文章擷取 OG/meta 圖片
+- **來源引用** — 每張投影片含可點擊的來源超連結
+
+### 付費牆支援
+
+對於已訂閱的網站（WSJ、Barron's、Economist 等）：
+1. 工具自動從 Chrome 載入該網站的 Cookie
+2. 若取得的內容為付費牆預覽，自動切換至 Playwright 瀏覽器使用您的訂閱 Cookie
+3. Cookie 擷取採**網域隔離**——僅使用目標網站的 Cookie，絕不存取其他網站
+
+### 支援語言
+
+繁體中文、English、日本語、한국어、Español、Français、Deutsch
+
+## 系統需求
+
+- **macOS**（Keynote 整合及瀏覽器 Cookie 存取）
+- **Python 3.10+**
+- **本機 LLM 伺服器**（LM Studio、Ollama、vLLM、LocalAI、Jan、llama.cpp 或 Text Gen WebUI 任一）
+- **LibreOffice**（PDF 匯出）— `brew install --cask libreoffice`
+- **Chrome**（選用，用於付費牆 Cookie 擷取）
