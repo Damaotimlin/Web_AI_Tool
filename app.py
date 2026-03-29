@@ -6,6 +6,7 @@ import json
 import subprocess
 import os
 import re
+import threading
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from pptx import Presentation
@@ -13,6 +14,24 @@ from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from datetime import datetime
 import prompts
+
+
+class StopFlag:
+    """Lightweight cancellation flag for long-running generators."""
+    def __init__(self):
+        self._event = threading.Event()
+
+    def stop(self):
+        self._event.set()
+
+    @property
+    def stopped(self):
+        return self._event.is_set()
+
+    def check(self):
+        """Raise GeneratorExit if stopped — call this between steps."""
+        if self._event.is_set():
+            raise GeneratorExit("Stopped by user")
 
 # AI provider presets: name → (base_url, description)
 AI_PROVIDERS = {
@@ -1638,13 +1657,16 @@ def build_session_for_url(url: str, cookies_text: str = "") -> requests.Session:
 
 _research_issues = []  # Shared between research and pipeline
 _research_results = []  # Store latest results for topic grouping
+_active_stop_flag = None  # Global stop flag for the current running pipeline
 
-def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_deep=False):
+def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_deep=False, stop_flag=None):
     """Research pipeline: keywords → crawl multiple sites → AI filters titles → deep scan."""
     global _research_issues
     _research_issues = []
     logs = []
     no_update = gr.update()
+    if stop_flag is None:
+        stop_flag = StopFlag()  # no-op flag if none provided
 
     # Normalize site_urls to a list
     if isinstance(site_urls, str):
@@ -1671,6 +1693,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
         logs.append(f"🤖 Model: {ext_model.split('/')[-1]}")
 
     try:
+        stop_flag.check()
         logs.append("🔍 Analyzing prompt with AI...")
         yield "\n".join(logs), "", "", no_update
 
@@ -1683,6 +1706,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
         all_links = []
         search_query = " ".join(keywords[:8])  # Use top keywords as search query
         for site_url in url_list:
+            stop_flag.check()
             site_domain = urlparse(normalize_url(site_url)).netloc.removeprefix("www.")
 
             # Detect search engines — search instead of crawl
@@ -1730,6 +1754,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
         yield "\n".join(logs), kw_display, "", no_update
 
         # Phase 1: AI judges which titles are relevant (keyword pre-filtered internally)
+        stop_flag.check()
         logs.append(f"🧠 AI filtering from {len(links)} titles...")
         yield "\n".join(logs), kw_display, "", no_update
 
@@ -1741,6 +1766,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
             yield "\n".join(logs), kw_display, "No matching articles found. Try a different topic or site.", gr.update(choices=[], value="")
             return
 
+        stop_flag.check()
         logs.append(f"📊 AI selected {len(candidates)} relevant articles")
         for c in candidates:
             logs.append(f"  → [{int(c['score']*100)}%] {c['title'][:60]} — {c['reason']}")
@@ -1753,6 +1779,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
 
         results = []
         for i, article in enumerate(top):
+            stop_flag.check()
             logs.append(f"  📖 [{i+1}/{len(top)}] {article['title'][:50]}...")
             yield "\n".join(logs), kw_display, "", no_update
 
@@ -1767,6 +1794,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
         _research_results = results
 
         # Phase 3: AI cross-checks articles to group related topics
+        stop_flag.check()
         if len(results) > 1:
             logs.append("🔗 AI cross-checking articles for related topics...")
             yield "\n".join(logs), kw_display, "", no_update
@@ -1815,16 +1843,22 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
             top_choice = url_choices[0]
         yield "\n".join(logs), kw_display, result_text, gr.update(choices=url_choices, value=top_choice)
 
+    except GeneratorExit:
+        logs.append("\n🛑 Stopped by user")
+        yield "\n".join(logs), "", "", no_update
+        return
     except Exception as e:
         logs.append(f"❌ Error: {e}")
         yield "\n".join(logs), "", "", no_update
 
 
-def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cookies_text, user_prompt="", extra_urls=None):
+def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cookies_text, user_prompt="", extra_urls=None, stop_flag=None):
     """Generate keynote from one or more article URLs. If extra_urls provided, combines content."""
     logs = []
     issues = list(_research_issues)  # Carry over any crawl issues
     lang2 = lang2 if lang2 and lang2 != "None" else ""
+    if stop_flag is None:
+        stop_flag = StopFlag()
 
     # Resolve refinement model for translation & slide generation
     available = get_available_models()
@@ -1854,6 +1888,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
             logs.append(f"📰 Combining {len(unique_urls)} related articles")
 
         # Fetch all article content
+        stop_flag.check()
         all_content = []
         fetched_sources = []  # Track successfully fetched article URLs
         for i, article_url in enumerate(unique_urls):
@@ -1899,6 +1934,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
             logs.append("  ℹ️ No suitable image found")
         yield "\n".join(logs), None, ""
 
+        stop_flag.check()
         logs.append("🌐 Translating & summarizing...")
         yield "\n".join(logs), None, ""
 
@@ -1911,6 +1947,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
             logs.append(f"⚠️ Translation failed, using raw content excerpt")
         yield "\n".join(logs), None, summary
 
+        stop_flag.check()
         batch_info = f" (in batches of 4)" if num_slides > 5 else ""
         logs.append(f"🧠 Generating {num_slides} slides{batch_info}...")
         yield "\n".join(logs), None, summary
@@ -1983,6 +2020,10 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
 
         yield "\n".join(logs), download_files, summary
 
+    except GeneratorExit:
+        logs.append("\n🛑 Stopped by user")
+        yield "\n".join(logs), None, ""
+        return
     except Exception as e:
         logs.append(f"❌ Error: {e}")
         yield "\n".join(logs), None, ""
@@ -1990,7 +2031,7 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
 
 # --- UI ---
 css = """
-/* === Chrome Extension popup — compact dark === */
+/* === Web AI Tool — compact dark === */
 *, *::before, *::after { box-sizing: border-box; }
 
 body {
@@ -2066,19 +2107,28 @@ body {
     color: #ccc !important;
 }
 
-/* ── Inputs ── */
+/* ── Inputs — consistent 34px height ── */
 .gradio-container input[type="text"],
 .gradio-container textarea,
 .gradio-container select,
-.gradio-container .wrap input,
+.gradio-container .wrap input {
+    background: #333 !important;
+    border: 1px solid #444 !important;
+    color: #e0e0e0 !important;
+    border-radius: 5px !important;
+    font-size: 12.5px !important;
+    padding: 6px 8px !important;
+    height: 34px !important;
+    transition: border-color 0.15s;
+}
+.gradio-container textarea { height: auto !important; }
 .gradio-container .secondary-wrap {
     background: #333 !important;
     border: 1px solid #444 !important;
     color: #e0e0e0 !important;
     border-radius: 5px !important;
     font-size: 12.5px !important;
-    padding: 7px 9px !important;
-    transition: border-color 0.15s;
+    padding: 4px 8px !important;
 }
 .gradio-container input[type="text"]:focus,
 .gradio-container textarea:focus {
@@ -2093,8 +2143,17 @@ body {
     background: #333 !important;
     border: 1px solid #444 !important;
     border-radius: 5px !important;
-    min-height: 32px !important;
+    min-height: 34px !important;
+    max-height: 34px !important;
     padding: 0 8px !important;
+    display: flex !important;
+    align-items: center !important;
+}
+/* Multiselect dropdowns can grow */
+.ext-site-tags .wrap.svelte-aqlk7e,
+.ext-site-tags .wrap[data-testid] {
+    max-height: 100px !important;
+    min-height: 36px !important;
 }
 
 /* ── Tabs ── */
@@ -2149,9 +2208,9 @@ body {
     border: 1px solid #444 !important;
     border-radius: 5px !important;
     font-size: 13px !important;
-    padding: 2px 8px !important;
+    padding: 6px 8px !important;
     min-width: 36px !important;
-    max-height: 32px !important;
+    height: 34px !important;
     cursor: pointer;
 }
 .ext-refresh-btn:hover { background: #3e3e3e !important; }
@@ -2159,10 +2218,14 @@ body {
 /* ── Slider compact ── */
 .gradio-container input[type="range"] { accent-color: #1a73e8; }
 .gradio-container input[type="number"] {
-    background: #333 !important; border: 1px solid #444 !important;
-    color: #ddd !important; border-radius: 4px !important;
-    width: 44px !important; font-size: 11px !important;
-    padding: 2px 4px !important;
+    background: #333 !important;
+    border: 1px solid #444 !important;
+    color: #ddd !important;
+    border-radius: 5px !important;
+    width: 60px !important;
+    font-size: 12.5px !important;
+    padding: 6px 8px !important;
+    height: 34px !important;
 }
 
 /* ── Radio / checkbox — fully restore ── */
@@ -2198,6 +2261,16 @@ body {
     gap: 6px !important;
     padding: 4px 8px !important;
     cursor: pointer !important;
+}
+/* Radio/checkbox group container — align height with inputs */
+.gradio-container .wrap:has(> label > input[type="radio"]),
+.gradio-container .wrap:has(> label > input[type="checkbox"]) {
+    min-height: 34px !important;
+    max-height: none !important;
+    display: flex !important;
+    flex-wrap: wrap !important;
+    align-items: center !important;
+    gap: 0 !important;
 }
 
 /* ── Section divider ── */
@@ -2592,22 +2665,15 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         domains_str = ", ".join(domains_loaded)
         return combined, f'<p style="font-size:10px;color:#8bc34a;">Loaded {count} cookies for {domains_str} from {browser}</p>'
 
-    def on_sites_change(sites, cat_name):
-        """Save site selections back to the current category."""
-        if isinstance(sites, list) and cat_name:
-            cats = load_categories()
-            clean = [s.strip() for s in sites if s and s.strip()]
-            cats[cat_name] = clean
-            save_categories(cats)
+    def on_sites_change(sites):
+        """Save current site selections for the research pipeline."""
+        if isinstance(sites, list):
             save_sites(sites)
-            return _cat_status_html(f"✅ Saved {len(clean)} sites to \"{cat_name}\"")
-        return ""
 
     def on_category_change(cat_name, use_all):
         """Switch sites dropdown to show the selected category's sites."""
         cats = load_categories()
         if use_all:
-            # Combine all categories
             all_sites = []
             seen = set()
             for sites in cats.values():
@@ -2699,7 +2765,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
     refresh_btn.click(refresh_models, outputs=[model_input])
     site_category.change(on_category_change, inputs=[site_category, site_category_all], outputs=[research_site])
     site_category_all.change(on_all_categories_toggle, inputs=[site_category_all, site_category], outputs=[research_site])
-    research_site.change(on_sites_change, inputs=[research_site, site_category], outputs=[cat_status])
+    research_site.change(on_sites_change, inputs=[research_site])
     cookie_load_btn.click(on_load_cookies, inputs=[cookie_browser, research_site], outputs=[cookies_input, cookie_status])
 
     # Category management events
@@ -2712,6 +2778,10 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
 
     def run_research_and_maybe_keynote(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, depth):
         """Run research, then optionally auto-generate keynote from top result."""
+        global _active_stop_flag
+        sf = StopFlag()
+        _active_stop_flag = sf
+
         # Save preferences
         is_deep = depth == "Deep"
         save_prefs(max_articles=int(max_articles or 30), auto_keynote=bool(auto_gen),
@@ -2725,15 +2795,23 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         last_picker = no_kn
         top_selection = None
 
-        for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_deep=is_deep):
-            last_res_log = res_log
-            last_kw = res_kw
-            last_out = res_out
-            last_picker = picker_update
-            # Capture the top selection from the final picker update
-            if isinstance(picker_update, dict) and picker_update.get("value"):
-                top_selection = picker_update["value"]
-            yield res_log, res_kw, res_out, picker_update, no_kn, no_kn, no_kn
+        try:
+            for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_deep=is_deep, stop_flag=sf):
+                sf.check()
+                last_res_log = res_log
+                last_kw = res_kw
+                last_out = res_out
+                last_picker = picker_update
+                # Capture the top selection from the final picker update
+                if isinstance(picker_update, dict) and picker_update.get("value"):
+                    top_selection = picker_update["value"]
+                yield res_log, res_kw, res_out, picker_update, no_kn, no_kn, no_kn
+        except GeneratorExit:
+            last_res_log += "\n\n🛑 Stopped by user"
+            yield last_res_log, last_kw, last_out, last_picker, no_kn, no_kn, no_kn
+            return
+        finally:
+            _active_stop_flag = None
 
         if not auto_gen:
             return
@@ -2782,7 +2860,8 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         last_res_log += f"\n\n🚀 Auto-generating Keynote from: {title[:60]}{combine_msg}..."
         yield last_res_log, last_kw, last_out, last_picker, f"🚀 Starting Keynote generation...\n📎 {title[:70]}{combine_msg}\n🔗 {url}", no_kn, no_kn
 
-        for kn_log, kn_file, kn_summary in run_pipeline(url, l1, l2, num, thm, True, model, cookies, user_prompt=prompt, extra_urls=extra_urls):
+        for kn_log, kn_file, kn_summary in run_pipeline(url, l1, l2, num, thm, True, model, cookies, user_prompt=prompt, extra_urls=extra_urls, stop_flag=sf):
+            sf.check()
             yield last_res_log, last_kw, last_out, last_picker, kn_log, kn_file, kn_summary
 
     research_event = research_btn.click(
@@ -2796,14 +2875,23 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         lambda: gr.update(interactive=False),
         outputs=[research_stop],
     )
+    def _trigger_stop():
+        global _active_stop_flag
+        if _active_stop_flag:
+            _active_stop_flag.stop()
+        return gr.update(interactive=False)
+
     research_stop.click(
-        lambda: gr.update(interactive=False),
+        _trigger_stop,
         outputs=[research_stop],
         cancels=[research_event],
     )
 
     def run_from_picker(selection, l1, l2, slides, thm, mdl, cookies, prompt):
         """Extract URL from picker selection and run keynote pipeline."""
+        global _active_stop_flag
+        sf = StopFlag()
+        _active_stop_flag = sf
         try:
             if not selection or "|" not in selection:
                 yield "❌ No article selected — run Research first", None, ""
@@ -2813,9 +2901,13 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
             if not url.startswith("http"):
                 yield f"❌ Invalid URL: {url}", None, ""
                 return
-            yield from run_pipeline(url, l1, l2, int(slides), thm, True, mdl, cookies, user_prompt=prompt)
+            yield from run_pipeline(url, l1, l2, int(slides), thm, True, mdl, cookies, user_prompt=prompt, stop_flag=sf)
+        except GeneratorExit:
+            yield "🛑 Stopped by user", None, ""
         except Exception as e:
             yield f"❌ Error: {e}", None, ""
+        finally:
+            _active_stop_flag = None
 
     pick_event = generate_from_research.click(
         lambda: gr.update(interactive=True),
@@ -2829,14 +2921,22 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         outputs=[pick_stop],
     )
     pick_stop.click(
-        lambda: gr.update(interactive=False),
+        _trigger_stop,
         outputs=[pick_stop],
         cancels=[pick_event],
     )
 
     def run_pipeline_and_save(url, l1, l2, slides, thm, open_kn, mdl, cookies):
+        global _active_stop_flag
+        sf = StopFlag()
+        _active_stop_flag = sf
         save_prefs(slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm)
-        yield from run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies)
+        try:
+            yield from run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies, stop_flag=sf)
+        except GeneratorExit:
+            yield "🛑 Stopped by user", None, ""
+        finally:
+            _active_stop_flag = None
 
     keynote_event = btn.click(
         lambda: gr.update(interactive=True),
@@ -2850,7 +2950,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         outputs=[keynote_stop],
     )
     keynote_stop.click(
-        lambda: gr.update(interactive=False),
+        _trigger_stop,
         outputs=[keynote_stop],
         cancels=[keynote_event],
     )
