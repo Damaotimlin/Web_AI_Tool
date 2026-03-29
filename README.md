@@ -1,52 +1,166 @@
-# Web → Keynote Generator
+# Web AI Tool
 
-Fetches any web page, translates it with a local LLM, and exports a `.pptx` that opens in Keynote.
+A local-first research and presentation tool that crawls news sites, filters articles with AI, and generates dual-language Keynote/PDF presentations — all powered by local LLMs via LM Studio.
+
+## What It Does
+
+1. **Research** — Enter a topic, and the tool crawls multiple news/tech sites, uses AI to filter and score article relevance, then deep-reads the best matches
+2. **Translate & Summarize** — Translates article content into your target language with a detailed summary
+3. **Generate Slides** — Produces a dual-language presentation (e.g. zh-TW + English) with themed slides, source citations, and cover images
+4. **Export** — Outputs PDF (via LibreOffice) and PPTX, auto-opens when done
 
 ## Stack
-- **AI**: LM Studio (MLX) → `localhost:1234`
-- **Web Fetch**: Jina Reader (bot-bypass)
-- **Frontend**: Gradio → `localhost:7860`
-- **Export**: python-pptx → Keynote
+
+| Component | Technology |
+|-----------|-----------|
+| AI Backend | [LM Studio](https://lmstudio.ai) (local LLM, OpenAI-compatible API on `localhost:1234`) |
+| Web Scraping | Requests + BeautifulSoup, Playwright (paywall sites), Jina Reader (fallback) |
+| Frontend | [Gradio](https://gradio.app) on `localhost:7860` |
+| Slide Export | python-pptx (PPTX) + LibreOffice headless (PDF) |
+| Prompts | Centralized in `prompts.py` for easy editing |
 
 ## Setup
 
 ```bash
-# 1. Install dependencies
+# 1. Install Python dependencies
 pip install -r requirements.txt
 
-# 2. Start LM Studio → enable Local Server on port 1234
-#    Load: qwen2.5-72b-instruct (MLX 4bit)
+# 2. Install Playwright browser (for paywall site support)
+python -m playwright install chromium
 
-# 3. Run
-python src/app.py
+# 3. Install LibreOffice (for PDF export)
+brew install --cask libreoffice
+
+# 4. Start LM Studio
+#    - Enable Local Server on port 1234
+#    - Load one or two models (see Model Routing below)
+
+# 5. Run the app
+python app.py
 ```
 
-Open browser at http://localhost:7860
+Open http://localhost:7860 in your browser.
 
 ## Project Structure
 
 ```
-web-to-keynote/
-├── src/
-│   └── app.py          # Main app (Gradio UI + pipeline)
-├── outputs/            # Generated .pptx files
-├── .vscode/
-│   ├── launch.json     # F5 to run
-│   └── tasks.json      # Cmd+Shift+B to run
-├── requirements.txt
+Web_AI_Tool/
+├── app.py                 # Main application (UI + pipelines)
+├── prompts.py             # All AI prompt templates
+├── requirements.txt       # Python dependencies
+├── outputs/               # Generated PPTX/PDF files
+│   └── .img_cache/        # Downloaded article images
+├── .saved_categories.json # Site categories (auto-created)
+├── .saved_prefs.json      # User preferences (auto-created)
 └── README.md
 ```
 
-## Usage
+## Features
 
-1. Paste any URL
-2. Select language (zh-TW / English / Japanese / Korean)
-3. Set number of slides (3–12)
-4. Pick a theme (Dark / Light / Blue)
-5. Click **Generate Keynote**
-6. `.pptx` auto-opens in Keynote
+### Research Tab
 
-## Notes
-- LM Studio must be running before launching the app
-- Outputs saved to `./outputs/` with timestamps
-- Change `MODEL` in `app.py` to match your loaded model name in LM Studio
+- **Topic-based research** — Enter a topic like "Impact of AI regulation on tech companies"
+- **Multi-site crawling** — Crawls 10+ sites simultaneously (finance, tech, or custom)
+- **AI keyword extraction** — Generates 15-25 search keywords from your topic
+- **AI title filtering** — Scores article relevance in batches of 40
+- **Deep reading** — AI reads full article content and scores top candidates
+- **Topic grouping** — Groups related articles by sub-theme
+- **Auto-generate** — Optionally auto-generates a keynote from the top result
+
+### Site Categories
+
+- **Built-in categories**: Finance (MarketWatch, WSJ, Barron's, Economist, Reuters, Investopedia) and Tech (TechCrunch, Ars Technica, The Verge, Wired, VentureBeat, and more)
+- **Custom categories** — Add, rename, delete categories via the Manage Categories panel
+- **Per-category memory** — Each category remembers its own site selections
+- **"All categories" mode** — Combine all sites for broad research
+
+### Crawl Depth
+
+| Mode | Behavior | Pages/Site | Time |
+|------|----------|-----------|------|
+| Standard | Crawl homepage only | ~80 links | ~2-5 min total |
+| Deep | Follow section/category pages matching keywords | ~150 links | ~5-10 min total |
+
+Deep crawl identifies section pages (e.g. `/technology/`, `/markets/`) and prioritizes those matching your search keywords.
+
+### Keynote Tab
+
+- **Direct URL mode** — Paste any article URL to generate a presentation
+- **Dual-language** — Primary + secondary language on each slide (e.g. zh-TW + English)
+- **3 themes** — Dark, Light, Blue
+- **Cover images** — Auto-extracted from article OG/meta images
+- **Source citations** — Clickable hyperlinks on each slide
+- **Batch generation** — Slides generated in batches of 4 for reliability
+
+### Supported Languages
+
+zh-TW, English, Japanese, Korean, Spanish, French, German
+
+### Export Formats
+
+- **PDF** — Auto-generated via LibreOffice headless
+- **PPTX** — Always generated (python-pptx)
+- **Auto-download** — PDF auto-downloads in browser; PPTX available as backup
+
+### Paywall Support
+
+For sites you have subscriptions to (WSJ, Barron's, Economist, etc.):
+
+1. The tool auto-loads cookies from your Chrome browser
+2. If direct fetch returns a paywall teaser, it falls through to a Playwright browser with your cookies
+3. Cookie extraction is **domain-sandboxed** — only the target site's cookies are ever used
+
+You can verify cookie isolation by running:
+```bash
+python test_cookie_sandbox.py
+```
+
+## Model Routing
+
+The tool supports a **2-stage pipeline** when two models are loaded in LM Studio:
+
+| Stage | Model Pattern | Purpose |
+|-------|--------------|---------|
+| Extraction | `*35b-a3b*` | Keyword extraction, title filtering (fast) |
+| Refinement | `*claude*` or `*reasoning*` | Translation, slide generation (quality) |
+
+If only one model is loaded, it's used for everything. Select "auto" in the model dropdown to enable routing.
+
+## Fetch Pipeline
+
+Content fetching uses a 4-method fallback chain:
+
+1. **Direct fetch** with session cookies + full browser headers
+2. **Direct fetch** with auto-loaded Chrome domain cookies
+3. **Playwright browser** with domain-scoped cookies (for paywalled content)
+4. **Jina Reader** as last resort
+
+Sites with RSS feeds (WSJ, Barron's, Economist, TechCrunch, etc.) fall back to RSS when direct crawling is blocked.
+
+## Number Formatting
+
+Prompts enforce consistent number formatting:
+
+- **English**: `$15B`, `$1.25M`, `3,500`
+- **Chinese**: `150億美元`, `1,250萬`
+- Always digits, never spelled out
+
+## Configuration
+
+All preferences are auto-saved between sessions:
+
+- Language selections
+- Slide count
+- Theme
+- Site categories and selections
+- Crawl depth
+- Auto-keynote toggle
+- Last used category
+
+## Requirements
+
+- **macOS** (for Keynote integration and browser cookie access)
+- **Python 3.10+**
+- **LM Studio** running on port 1234 with at least one model loaded
+- **LibreOffice** (for PDF export) — `brew install --cask libreoffice`
+- **Chrome** (optional, for paywall cookie extraction)

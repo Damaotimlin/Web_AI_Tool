@@ -5,3 +5,4 @@ lxml>=4.9.0
 beautifulsoup4>=4.12.0
 browser_cookie3>=0.20.0
 googlenewsdecoder>=0.1.0
+playwright>=1.40.0

@@ -12,6 +12,7 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from datetime import datetime
+import prompts
 
 LM_STUDIO_BASE = "http://localhost:1234"
 LM_STUDIO_URL = f"{LM_STUDIO_BASE}/v1/chat/completions"
@@ -164,6 +165,23 @@ def pick_default_model(available: list[str]) -> str:
 
 BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+BROWSER_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 
 def build_session(cookies_text: str = "") -> requests.Session:
     """Build a requests.Session with optional cookies.
@@ -173,7 +191,7 @@ def build_session(cookies_text: str = "") -> requests.Session:
       - Path to a Netscape/Mozilla cookies.txt file
     """
     session = requests.Session()
-    session.headers.update({"User-Agent": BROWSER_UA})
+    session.headers.update(BROWSER_HEADERS)
 
     cookies_text = (cookies_text or "").strip()
     if not cookies_text:
@@ -326,10 +344,138 @@ def resolve_google_news_url(url: str) -> str:
     return url
 
 
+def _get_domain_cookies_for_playwright(url: str) -> list[dict]:
+    """Extract only the target domain's cookies from Chrome — never exposes other sites."""
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    domain = parsed.netloc.removeprefix("www.")
+    if not domain:
+        return []
+    try:
+        jar = browser_cookie3.chrome(domain_name=domain)
+        cookies = []
+        for c in jar:
+            # Strict match: cookie domain must be the target or a parent of the target
+            # e.g. for barrons.com, allow ".barrons.com" and "www.barrons.com"
+            # but never allow unrelated domains
+            cookie_domain = (c.domain or "").lstrip(".")
+            if cookie_domain != domain and not domain.endswith("." + cookie_domain):
+                continue
+            cookie = {
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain,
+                "path": c.path or "/",
+            }
+            if c.secure:
+                cookie["secure"] = True
+            if c.expires:
+                cookie["expires"] = c.expires
+            cookies.append(cookie)
+        return cookies
+    except Exception:
+        return []
+
+
+def _browser_fetch_html(url: str) -> str:
+    """Launch a sandboxed Playwright browser with only the target domain's cookies injected."""
+    from playwright.sync_api import sync_playwright
+
+    cookies = _get_domain_cookies_for_playwright(url)
+    if not cookies:
+        raise RuntimeError("No cookies found for this domain")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=BROWSER_UA,
+            locale="en-US",
+        )
+        context.add_cookies(cookies)
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)  # let JS render
+        html = page.content()
+        context.close()
+        browser.close()
+
+    return html
+
+
+def fetch_with_browser(url: str) -> str:
+    """Fetch article content using a sandboxed browser with only target-domain cookies."""
+    try:
+        html = _browser_fetch_html(url)
+    except ImportError:
+        raise RuntimeError("Playwright not installed")
+
+    text = html_to_text(html)
+    if len(text) > 200:
+        return text
+    raise ValueError("Browser fetch returned insufficient content")
+
+
+def crawl_with_browser(url: str, max_links: int = 80) -> list[dict]:
+    """Crawl links using a sandboxed browser with only target-domain cookies."""
+    try:
+        html = _browser_fetch_html(url)
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    parsed_base = urlparse(url)
+    links = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full_url = urljoin(url, href)
+        parsed = urlparse(full_url)
+        if parsed.netloc and parsed_base.netloc.removeprefix("www.") not in parsed.netloc:
+            continue
+        path = parsed.path.rstrip("/")
+        if not path or path == "" or len(path.split("/")) < 2:
+            continue
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        title = (a.get_text(strip=True) or "")[:200]
+        if title and len(title) > 10:
+            links.append({"url": full_url, "title": title})
+
+    return links[:max_links]
+
+
+# Paywall indicators — if extracted text contains these, it's likely truncated/gated
+_PAYWALL_MARKERS = re.compile(
+    r"subscribe to continue|sign in to read|create.{0,10}account|"
+    r"already a subscriber|for full access|paywall|"
+    r"subscribe now|log in to read|membership required|"
+    r"continue reading with|unlock this article|"
+    r"this content is for subscribers",
+    re.IGNORECASE,
+)
+
+# Minimum content length to consider a successful article fetch (not just a teaser)
+_MIN_ARTICLE_LENGTH = 800
+
+
+def _is_paywalled(text: str) -> bool:
+    """Check if fetched text looks like a paywall teaser rather than full article."""
+    if len(text) < _MIN_ARTICLE_LENGTH:
+        return True
+    if _PAYWALL_MARKERS.search(text[:2000]):
+        return True
+    return False
+
+
 def fetch_url(url: str, session: requests.Session | None = None) -> str:
-    """Fetch page content. Tries: 1) direct with session, 2) direct without, 3) Jina Reader."""
+    """Fetch page content. Tries: 1) direct with session, 2) direct without, 3) browser, 4) Jina Reader."""
     url = normalize_url(url)
     url = resolve_google_news_url(url)
+    best_text = ""
 
     # Try 1: direct fetch with session cookies
     if session and session.cookies:
@@ -337,8 +483,10 @@ def fetch_url(url: str, session: requests.Session | None = None) -> str:
             res = session.get(url, timeout=30)
             res.raise_for_status()
             text = html_to_text(res.text)
-            if len(text) > 200:
+            if len(text) > 200 and not _is_paywalled(text):
                 return text
+            if len(text) > len(best_text):
+                best_text = text
         except Exception:
             pass
 
@@ -348,18 +496,36 @@ def fetch_url(url: str, session: requests.Session | None = None) -> str:
         res = s.get(url, timeout=30)
         res.raise_for_status()
         text = html_to_text(res.text)
-        if len(text) > 200:
+        if len(text) > 200 and not _is_paywalled(text):
             return text
+        if len(text) > len(best_text):
+            best_text = text
     except Exception:
         pass
 
-    # Try 3: Jina Reader as last resort
+    # Try 3: Real browser with Chrome profile (handles paywalls with active subscriptions)
+    try:
+        text = fetch_with_browser(url)
+        if not _is_paywalled(text):
+            return text
+        if len(text) > len(best_text):
+            best_text = text
+    except Exception:
+        pass
+
+    # Try 4: Jina Reader as last resort
     try:
         res = requests.get(f"https://r.jina.ai/{url}", timeout=30)
         res.raise_for_status()
-        return res.text
+        text = res.text
+        if len(text) > len(best_text):
+            best_text = text
     except Exception:
         pass
+
+    # Return best content we got, even if paywalled (partial is better than nothing)
+    if best_text and len(best_text) > 200:
+        return best_text
 
     raise ValueError(f"All fetch methods failed for {url}")
 
@@ -402,80 +568,11 @@ def chat(prompt: str, model: str = "") -> str:
 
 def translate_content(content: str, language: str, model: str = "", user_prompt: str = "") -> str:
     """Translate and summarize content."""
-    user_instruction = ""
-    if user_prompt:
-        user_instruction = f"""
-The user's original research prompt was: "{user_prompt}"
-Consider this context when summarizing — focus on aspects most relevant to the user's interest.
-"""
-    prompt = f"""
-Translate and provide a comprehensive summary of the following content into {language}.
-The summary should be detailed and thorough (500-800 words). Cover all key points, data, quotes, and analysis.
-Do NOT be brief — include specific numbers, names, dates, and details from the article(s).
-ALWAYS use Arabic numerals with thousand separators for ALL numbers regardless of language (write "$1,250,000" not "one million" or "一百二十五萬", "3,500" not "three thousand" or "三千五百", "7.2%" not "seven percent" or "百分之七"). Never spell out numbers in any language — always use digits like 1,000 or 25.5%.
-{user_instruction}
-Content:
-{content[:12000]}
-"""
-    return chat(prompt, model)
-
-
-def _slide_json_template(lang1: str, lang2: str = "") -> str:
-    """Build the JSON example template based on selected languages."""
-    if lang2:
-        return f"""{{
-  "title_primary": "Title in {lang1}",
-  "title_secondary": "Title in {lang2}",
-  "subtitle_primary": "Subtitle in {lang1}",
-  "subtitle_secondary": "Subtitle in {lang2}",
-  "slides": [
-    {{
-      "heading_primary": "Heading in {lang1}",
-      "heading_secondary": "Heading in {lang2}",
-      "bullets_primary": ["Detailed point with specifics in {lang1}", "Another detailed point with data/numbers in {lang1}", "Third point with analysis in {lang1}", "Fourth point with context in {lang1}", "Fifth point with implications in {lang1}"],
-      "bullets_secondary": ["Same point in {lang2}", "Same point in {lang2}", "Same point in {lang2}", "Same point in {lang2}", "Same point in {lang2}"]
-    }}
-  ]
-}}"""
-    else:
-        return f"""{{
-  "title_primary": "Title in {lang1}",
-  "subtitle_primary": "Subtitle in {lang1}",
-  "slides": [
-    {{
-      "heading_primary": "Heading in {lang1}",
-      "bullets_primary": ["Detailed point with specifics in {lang1}", "Another detailed point with data/numbers in {lang1}", "Third point with analysis in {lang1}", "Fourth point with context in {lang1}", "Fifth point with implications in {lang1}"]
-    }}
-  ]
-}}"""
+    return chat(prompts.translate_and_summarize(content, language, user_prompt), model)
 
 
 def _build_slide_prompt(content: str, language: str, num_slides: int, lang2: str = "", user_instruction: str = "", slide_context: str = "") -> str:
-    """Build the prompt for generating slides."""
-    if lang2:
-        lang_instruction = f"Each slide MUST have BOTH {language} AND {lang2} versions of the heading and bullets."
-    else:
-        lang_instruction = f"All content must be in {language}."
-
-    return f"""
-Create exactly {num_slides} content slides for a keynote presentation.
-{lang_instruction}
-{user_instruction}
-{slide_context}
-IMPORTANT rules:
-- Each slide MUST have 4-6 detailed bullet points
-- Each bullet: full sentence (15-30 words), include specific data
-- Cover different angles: facts, analysis, market impact, quotes, outlook
-- Each slide should have a distinct sub-topic
-- SYNTHESIZE information from ALL sources if multiple are provided
-- ALWAYS use Arabic numerals with thousand separators ("$1,250,000" not "one million", "3,500" not "three thousand", "7.2%" not "seven percent")
-
-Content:
-{content}
-
-Respond ONLY with valid JSON, no markdown:
-{_slide_json_template(language, lang2)}
-"""
+    return prompts.generate_slides(content, language, num_slides, lang2, user_instruction, slide_context)
 
 
 def generate_slide_structure(content: str, language: str, num_slides: int, model: str = "", source_url: str = "", source_title: str = "", user_prompt: str = "", lang2: str = "") -> dict:
@@ -842,7 +939,7 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
 
     def _sanitize(s: str, max_len: int = 30) -> str:
         """Clean string for use in filename."""
-        s = re.sub(r'[\\/:*?"<>|]', '', s)
+        s = re.sub(r'[\\/:*?"<>|&\'()!@#$%^{};\[\]]', '', s)
         s = re.sub(r'\s+', '_', s.strip())
         return s[:max_len].rstrip('_')
 
@@ -860,31 +957,13 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
 
 def extract_keywords(prompt: str, model: str = "") -> list[str]:
     """Use AI to break down a prompt into broad search keywords."""
-    ai_prompt = f"""
-Analyze the following topic and extract 15-25 search keywords for finding related news articles.
-
-Rules:
-- Each keyword should be 1-2 words MAX
-- Cast a WIDE net — include:
-  * Direct terms (e.g. "Iran", "oil", "tariff")
-  * Related sectors/industries (e.g. "energy", "defense", "shipping")
-  * Key people/companies/indices (e.g. "S&P 500", "OPEC", "Boeing")
-  * Broader themes that connect (e.g. "inflation", "sanctions", "geopolitical")
-  * Synonyms and alternative phrasings (e.g. "crude" + "petroleum", "conflict" + "war")
-- The goal is to catch ALL potentially related articles, not just exact matches
-
-If the topic contains specific instructions about what to focus on, use those to guide which keywords to prioritize.
-
-Return ONLY a JSON array of strings, no markdown, no extra text.
-
-Topic: {prompt}
-"""
-    raw = chat(ai_prompt, model)
+    raw = chat(prompts.extract_keywords(prompt), model)
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
 
 RSS_FEEDS = {
+    # --- Finance / News ---
     "marketwatch.com": [
         "https://www.marketwatch.com/rss/topstories",
         "https://www.marketwatch.com/rss/marketpulse",
@@ -894,12 +973,107 @@ RSS_FEEDS = {
         "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
         "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     ],
+    "barrons.com": [
+        "https://feeds.barrons.com/barrons/review",
+        "https://feeds.barrons.com/barrons/market_lab",
+    ],
+    "economist.com": [
+        "https://www.economist.com/finance-and-economics/rss.xml",
+        "https://www.economist.com/business/rss.xml",
+        "https://www.economist.com/international/rss.xml",
+        "https://www.economist.com/leaders/rss.xml",
+    ],
+    # --- Tech ---
+    "techcrunch.com": [
+        "https://techcrunch.com/feed/",
+    ],
+    "arstechnica.com": [
+        "https://feeds.arstechnica.com/arstechnica/index",
+    ],
+    "theverge.com": [
+        "https://www.theverge.com/rss/index.xml",
+    ],
+    "wired.com": [
+        "https://www.wired.com/feed/rss",
+    ],
+    "thenextweb.com": [
+        "https://thenextweb.com/feed",
+    ],
+    "venturebeat.com": [
+        "https://venturebeat.com/feed/",
+    ],
+    "9to5mac.com": [
+        "https://9to5mac.com/feed/",
+    ],
+    "engadget.com": [
+        "https://www.engadget.com/rss.xml",
+    ],
+    "zdnet.com": [
+        "https://www.zdnet.com/news/rss.xml",
+    ],
+    "tomshardware.com": [
+        "https://www.tomshardware.com/feeds/all",
+    ],
 }
 
 # Sites that need Google News RSS as proxy (strong bot detection, no RSS)
-# Note: Google News URLs can't be resolved to original URLs, so articles
-# from these sites are title-only (no deep-scan)
 GOOGLE_NEWS_FALLBACK = {"reuters.com", "investopedia.com"}
+
+SAVED_CATEGORIES_FILE = os.path.join(os.path.dirname(__file__), ".saved_categories.json")
+
+DEFAULT_CATEGORIES = {
+    "Finance": [
+        "https://www.marketwatch.com",
+        "https://www.wsj.com",
+        "https://www.barrons.com",
+        "https://www.economist.com",
+        "https://www.reuters.com",
+        "https://www.investopedia.com",
+    ],
+    "Tech": [
+        "https://techcrunch.com",
+        "https://arstechnica.com",
+        "https://www.theverge.com",
+        "https://www.wired.com",
+        "https://thenextweb.com",
+        "https://venturebeat.com",
+        "https://9to5mac.com",
+        "https://www.engadget.com",
+        "https://www.zdnet.com",
+        "https://www.tomshardware.com",
+    ],
+}
+
+
+def load_categories() -> dict:
+    """Load saved categories from disk, merged with defaults."""
+    try:
+        with open(SAVED_CATEGORIES_FILE, "r") as f:
+            saved = json.load(f)
+            # Merge defaults for any missing categories
+            merged = {**DEFAULT_CATEGORIES}
+            merged.update(saved)
+            return merged
+    except (FileNotFoundError, json.JSONDecodeError):
+        return DEFAULT_CATEGORIES.copy()
+
+
+def save_categories(categories: dict):
+    """Save categories to disk."""
+    with open(SAVED_CATEGORIES_FILE, "w") as f:
+        json.dump(categories, f, indent=2)
+
+
+def get_all_suggested_sites(categories: dict) -> list[str]:
+    """Flatten all category sites into a single list for dropdown choices."""
+    all_sites = []
+    seen = set()
+    for sites in categories.values():
+        for s in sites:
+            if s not in seen:
+                all_sites.append(s)
+                seen.add(s)
+    return all_sites
 
 
 def crawl_rss_feeds(feed_urls: list[str], max_links: int = 80) -> list[dict]:
@@ -1087,7 +1261,8 @@ def crawl_site_links(base_url: str, session: requests.Session | None = None, max
 
     try:
         s = session or requests.Session()
-        s.headers.setdefault("User-Agent", BROWSER_UA)
+        for k, v in BROWSER_HEADERS.items():
+            s.headers.setdefault(k, v)
         # If session has no cookies, try auto-loading for this domain
         if not s.cookies:
             fresh = build_session_for_url(base_url)
@@ -1096,13 +1271,17 @@ def crawl_site_links(base_url: str, session: requests.Session | None = None, max
         res = s.get(base_url, timeout=15)
         res.raise_for_status()
     except Exception as e:
-        # Fallback 1: RSS feeds
+        # Fallback 1: Real browser with Chrome profile (paywall sites with subscriptions)
+        browser_links = crawl_with_browser(base_url, max_links)
+        if browser_links:
+            return browser_links
+        # Fallback 2: RSS feeds
         for rss_domain, feeds in RSS_FEEDS.items():
             if rss_domain in domain:
                 rss_links = crawl_rss_feeds(feeds, max_links)
                 if rss_links:
                     return rss_links
-        # Fallback 2: Google News RSS proxy
+        # Fallback 3: Google News RSS proxy
         for gn_domain in GOOGLE_NEWS_FALLBACK:
             if gn_domain in domain:
                 gn_links = crawl_google_news(gn_domain, max_links)
@@ -1143,6 +1322,167 @@ def crawl_site_links(base_url: str, session: requests.Session | None = None, max
             break
 
     return links
+
+
+# Patterns that indicate a section/category/topic page (not an individual article)
+_SECTION_PATTERNS = re.compile(
+    r"/(topic|topics|category|categories|section|sections|tag|tags|"
+    r"latest|news|opinion|analysis|markets|technology|tech|science|"
+    r"business|finance|economy|world|politics|industry|ai|crypto|"
+    r"startups|reviews|features|columns|archive)(/|$)", re.IGNORECASE
+)
+
+# Patterns that indicate an individual article (should NOT be followed for depth 2)
+_ARTICLE_PATTERNS = re.compile(
+    r"/\d{4}/\d{2}/|"           # date-based paths: /2024/03/
+    r"/[a-z0-9-]{30,}$|"        # long slugs (article titles)
+    r"/\d{5,}$|"                # numeric article IDs
+    r"\.(pdf|jpg|png|mp4)$",    # file extensions
+    re.IGNORECASE
+)
+
+
+def _is_section_page(url: str, base_domain: str) -> bool:
+    """Detect if a URL is likely a section/category page worth crawling deeper."""
+    parsed = urlparse(url)
+    # Must be same domain
+    if base_domain not in parsed.netloc:
+        return False
+    path = parsed.path.rstrip("/")
+    # Section pages typically have short paths (1-2 segments)
+    parts = [p for p in path.split("/") if p]
+    if len(parts) > 3 or len(parts) < 1:
+        return False
+    # Match section patterns
+    if _SECTION_PATTERNS.search(path):
+        return True
+    # Short path with 1-2 segments that don't look like articles
+    if len(parts) <= 2 and not _ARTICLE_PATTERNS.search(path):
+        return True
+    return False
+
+
+def _extract_links_from_html(html: str, base_url: str, seen: set, max_links: int = 80) -> list[dict]:
+    """Extract article links from HTML, deduplicating against seen set."""
+    soup = BeautifulSoup(html, "lxml")
+    parsed_base = urlparse(base_url)
+    links = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full_url = urljoin(base_url, href)
+        parsed = urlparse(full_url)
+
+        if parsed.netloc != parsed_base.netloc:
+            continue
+        canon = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if canon in seen:
+            continue
+        path_parts = [pt for pt in parsed.path.split("/") if pt]
+        if len(path_parts) < 2:
+            continue
+        skip_paths = {"login", "signup", "subscribe", "account", "search", "video", "podcasts", "#"}
+        if any(sk in parsed.path.lower() for sk in skip_paths):
+            continue
+        title = a.get_text(strip=True)
+        if not title or len(title) < 10:
+            continue
+
+        seen.add(canon)
+        links.append({"url": canon, "title": title})
+        if len(links) >= max_links:
+            break
+
+    return links
+
+
+def crawl_site_deep(base_url: str, keywords: list[str], session: requests.Session | None = None,
+                    max_links: int = 150, max_sub_pages: int = 10, log_fn=None) -> list[dict]:
+    """Depth-2 crawl: crawl main page, then selectively follow section/category pages.
+
+    Only follows pages that match section patterns or contain keywords in their URL/text.
+    Caps sub-page crawls to max_sub_pages to keep resource usage bounded.
+    """
+    base_url = normalize_url(base_url)
+    parsed = urlparse(base_url)
+    domain = parsed.netloc.removeprefix("www.")
+
+    s = session or requests.Session()
+    for k, v in BROWSER_HEADERS.items():
+        s.headers.setdefault(k, v)
+    if not s.cookies:
+        fresh = build_session_for_url(base_url)
+        if fresh.cookies:
+            s.cookies.update(fresh.cookies)
+
+    # Depth 1: crawl main page
+    try:
+        res = s.get(base_url, timeout=15)
+        res.raise_for_status()
+        main_html = res.text
+    except Exception:
+        # Try browser fallback
+        try:
+            main_html = _browser_fetch_html(base_url)
+        except Exception:
+            # Fall back to regular crawl (RSS etc)
+            return crawl_site_links(base_url, session=session, max_links=max_links)
+
+    seen = set()
+    all_links = _extract_links_from_html(main_html, base_url, seen, max_links)
+
+    if log_fn:
+        log_fn(f"    📄 Depth 1: {len(all_links)} links")
+
+    # Identify section pages to follow
+    soup = BeautifulSoup(main_html, "lxml")
+    section_urls = []
+    kw_lower = [k.lower() for k in keywords] if keywords else []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full_url = urljoin(base_url, href)
+        canon = f"{urlparse(full_url).scheme}://{urlparse(full_url).netloc}{urlparse(full_url).path}"
+
+        if canon == base_url.rstrip("/") or canon in seen:
+            continue
+
+        if _is_section_page(full_url, domain):
+            # Prioritize sections that match keywords
+            link_text = (a.get_text(strip=True) + " " + urlparse(full_url).path).lower()
+            keyword_match = any(kw in link_text for kw in kw_lower) if kw_lower else False
+            section_urls.append((full_url, keyword_match))
+
+    # Sort: keyword-matching sections first, then others
+    section_urls.sort(key=lambda x: (not x[1], x[0]))
+    section_urls = [url for url, _ in section_urls[:max_sub_pages]]
+
+    if log_fn and section_urls:
+        log_fn(f"    🔍 Depth 2: following {len(section_urls)} section pages...")
+
+    # Depth 2: crawl selected section pages
+    for sub_url in section_urls:
+        if len(all_links) >= max_links:
+            break
+        try:
+            res = s.get(sub_url, timeout=15)
+            res.raise_for_status()
+            sub_html = res.text
+        except Exception:
+            try:
+                sub_html = _browser_fetch_html(sub_url)
+            except Exception:
+                continue
+
+        remaining = max_links - len(all_links)
+        new_links = _extract_links_from_html(sub_html, sub_url, seen, remaining)
+        all_links.extend(new_links)
+
+        if log_fn and new_links:
+            section_name = urlparse(sub_url).path.rstrip("/").split("/")[-1] or "index"
+            log_fn(f"    📄 /{section_name}: +{len(new_links)} links")
+
+    return all_links
 
 
 def score_text(text: str, keywords: list[str]) -> float:
@@ -1202,23 +1542,7 @@ def ai_filter_titles(titles: list[dict], prompt: str, model: str = "", keywords:
 def _ai_filter_batch(titles: list[dict], prompt: str, model: str = "") -> list[dict]:
     """AI judges a single batch of titles."""
     title_list = "\n".join(f"{i}. {t['title']}" for i, t in enumerate(titles))
-    ai_prompt = f"""
-You are filtering news article titles for relevance to a research topic.
-
-Topic: {prompt}
-
-Article titles:
-{title_list}
-
-For each title, decide if it is relevant to the topic.
-Return ONLY a JSON array of objects for the RELEVANT titles, no markdown, no extra text.
-Each object: {{"index": <number>, "relevance": <0.0-1.0>, "reason": "<brief reason>"}}
-
-Example: [{{"index": 3, "relevance": 0.9, "reason": "Directly about oil prices"}}]
-
-If none are relevant, return an empty array: []
-"""
-    raw = chat(ai_prompt, model)
+    raw = chat(prompts.filter_titles(prompt, title_list), model)
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     try:
         judgments = json.loads(raw)
@@ -1244,20 +1568,8 @@ def ai_score_article(url: str, prompt: str, session: requests.Session | None = N
     except Exception:
         return {"score": 0, "reason": "Failed to fetch"}
 
-    ai_prompt = f"""
-You are evaluating whether a news article is relevant to a research topic.
-
-Research topic: {prompt}
-
-Article content (excerpt):
-{content}
-
-Rate the relevance from 0.0 to 1.0 and explain briefly why.
-Return ONLY valid JSON, no markdown:
-{{"relevance": <0.0-1.0>, "reason": "<1 sentence>"}}
-"""
     try:
-        raw = chat(ai_prompt, model)
+        raw = chat(prompts.score_article(prompt, content), model)
         raw = raw.strip().replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         return {"score": result.get("relevance", 0), "reason": result.get("reason", "")}
@@ -1268,7 +1580,10 @@ Return ONLY valid JSON, no markdown:
 def build_session_for_url(url: str, cookies_text: str = "") -> requests.Session:
     """Build a session with cookies specific to the URL's domain."""
     session = requests.Session()
-    session.headers.update({"User-Agent": BROWSER_UA})
+    session.headers.update(BROWSER_HEADERS)
+    # Set Referer to the site's homepage so it looks like in-site navigation
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    session.headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
     # Increase header limit for sites like Yahoo that send excessive Set-Cookie headers
     import http.client
     http.client._MAXHEADERS = 1000
@@ -1302,7 +1617,7 @@ def build_session_for_url(url: str, cookies_text: str = "") -> requests.Session:
 _research_issues = []  # Shared between research and pipeline
 _research_results = []  # Store latest results for topic grouping
 
-def run_research(prompt, site_urls, max_articles, model, cookies_text):
+def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_deep=False):
     """Research pipeline: keywords → crawl multiple sites → AI filters titles → deep scan."""
     global _research_issues
     _research_issues = []
@@ -1363,11 +1678,23 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
                 session = build_session_for_url(site_url, cookies_text)
                 if session.cookies:
                     logs.append(f"🔐 Loaded {len(session.cookies)} cookies for {urlparse(normalize_url(site_url)).netloc}")
-                logs.append(f"🕷️ Crawling {site_url}...")
+                depth_label = " (deep)" if crawl_deep else ""
+                logs.append(f"🕷️ Crawling {site_url}{depth_label}...")
                 yield "\n".join(logs), kw_display, "", no_update
 
+                # Log callback for deep crawl progress
+                def _log_update(msg, _logs=logs, _kw=kw_display):
+                    _logs.append(msg)
+
                 try:
-                    site_links = crawl_site_links(site_url, session=session, max_links=80)
+                    if crawl_deep:
+                        site_links = crawl_site_deep(
+                            site_url, keywords, session=session,
+                            max_links=150, max_sub_pages=10,
+                            log_fn=_log_update,
+                        )
+                    else:
+                        site_links = crawl_site_links(site_url, session=session, max_links=80)
                     logs.append(f"  📄 Found {len(site_links)} links from {urlparse(normalize_url(site_url)).netloc}")
                     all_links.extend(site_links)
                 except Exception as e:
@@ -1424,19 +1751,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text):
 
             try:
                 titles_for_grouping = "\n".join(f"{i}. {r['title']}" for i, r in enumerate(results))
-                group_prompt = f"""
-You have a list of news articles found for the topic: "{prompt}"
-
-Articles:
-{titles_for_grouping}
-
-Group these articles by sub-topic/theme. Articles covering the same event or angle should be grouped together.
-Return ONLY valid JSON, no markdown:
-[
-  {{"topic": "Brief topic name", "articles": [0, 2, 5], "summary": "What these articles share"}}
-]
-"""
-                raw = chat(group_prompt, ref_model)
+                raw = chat(prompts.group_articles(prompt, titles_for_grouping), ref_model)
                 raw = raw.strip().replace("```json", "").replace("```", "").strip()
                 topic_groups = json.loads(raw)
                 logs.append(f"📊 Found {len(topic_groups)} topic groups:")
@@ -1601,51 +1916,50 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         logs.append(f"✅ Saved: {os.path.basename(pptx_path)}")
         yield "\n".join(logs), None, summary
 
-        # Export to Keynote (.key) and PDF via Keynote
-        logs.append("📄 Exporting to Keynote & PDF...")
+        # Export to PDF via LibreOffice (headless) and open in Keynote
+        logs.append("📄 Exporting to PDF...")
         yield "\n".join(logs), None, summary
 
-        key_path = pptx_path.replace(".pptx", ".key")
         pdf_path = pptx_path.replace(".pptx", ".pdf")
-        try:
-            export_script = f'''
-            tell application "Keynote"
-                activate
-                set theDoc to open POSIX file "{pptx_path}"
-                -- Wait for Keynote to finish importing
-                repeat 30 times
-                    try
-                        if playing of theDoc is false then exit repeat
-                    end try
-                    delay 1
-                end repeat
-                delay 3
-                save theDoc in POSIX file "{key_path}"
-                delay 1
-                export theDoc to POSIX file "{pdf_path}" as PDF
-                delay 1
-                close theDoc saving no
-            end tell
-            '''
-            subprocess.run(["osascript", "-e", export_script], timeout=120, check=True)
-            logs.append(f"✅ Keynote: {os.path.basename(key_path)}")
-            logs.append(f"✅ PDF: {os.path.basename(pdf_path)}")
-            # Remove intermediate PPTX
+        download_files = []
+
+        # PDF export via LibreOffice headless
+        pdf_ok = False
+        soffice_paths = [
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+            "soffice",
+            "libreoffice",
+        ]
+        for soffice in soffice_paths:
             try:
-                os.remove(pptx_path)
-            except OSError:
-                pass
-            path = pdf_path
-        except Exception as e:
-            issues.append(f"Export failed: {e}")
-            logs.append(f"⚠️ Export failed, using PPTX: {e}")
-            path = pptx_path
+                subprocess.run(
+                    [soffice, "--headless", "--convert-to", "pdf",
+                     "--outdir", os.path.dirname(pptx_path), pptx_path],
+                    timeout=120, check=True, capture_output=True,
+                )
+                if os.path.exists(pdf_path):
+                    logs.append(f"✅ PDF: {os.path.basename(pdf_path)}")
+                    download_files.append(pdf_path)
+                    pdf_ok = True
+                    break
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                continue
+
+        if not pdf_ok:
+            logs.append("⚠️ PDF export unavailable (install LibreOffice for PDF)")
+
+        download_files.append(pptx_path)
+        logs.append(f"✅ PPTX: {os.path.basename(pptx_path)}")
 
         if open_keynote:
-            subprocess.run(["open", key_path if os.path.exists(key_path) else path])
-            logs.append(f"🎬 Opened {os.path.basename(key_path if os.path.exists(key_path) else path)}")
+            if pdf_ok:
+                subprocess.run(["open", pdf_path])
+                logs.append(f"🎬 Opened {os.path.basename(pdf_path)}")
+            else:
+                subprocess.run(["open", "-a", "Keynote", pptx_path])
+                logs.append(f"🎬 Opened in Keynote: {os.path.basename(pptx_path)}")
 
-        yield "\n".join(logs), path, summary
+        yield "\n".join(logs), download_files, summary
 
     except Exception as e:
         logs.append(f"❌ Error: {e}")
@@ -2010,12 +2324,14 @@ progress_js = """
                 }, 3000);
             }
         });
-        // Auto-download: click download link when file appears
+        // Auto-download: prefer PDF, skip .key and .pptx
         document.querySelectorAll('a[download]').forEach(a => {
             if (a.dataset.autoDownloaded) return;
             if (a.href && a.href.includes('/file=')) {
                 a.dataset.autoDownloaded = 'true';
-                setTimeout(() => a.click(), 500);
+                if (a.href.endsWith('.pdf') || a.download.endsWith('.pdf')) {
+                    setTimeout(() => a.click(), 500);
+                }
             }
         });
     });
@@ -2044,20 +2360,51 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         )
         refresh_btn = gr.Button("↻", elem_classes=["ext-refresh-btn"], scale=1, min_width=40)
 
+    categories = load_categories()
+    cat_names = list(categories.keys())
     saved_sites = load_saved_sites()
     sites_history = load_sites_history()
-    # Merge: history has all ever-used, saved_sites are currently active
-    all_choices = list(dict.fromkeys(sites_history + saved_sites))  # dedupe, preserve order
+    all_suggested = get_all_suggested_sites(categories)
+    all_choices = list(dict.fromkeys(all_suggested + sites_history + saved_sites))
     prefs = load_saved_prefs()
+    default_cat = prefs.get("last_category", cat_names[0] if cat_names else "Finance")
+    if default_cat not in cat_names:
+        default_cat = cat_names[0] if cat_names else "Finance"
+
+    with gr.Row():
+        site_category = gr.Radio(
+            choices=cat_names,
+            value=default_cat,
+            label="Category",
+            scale=3,
+        )
+        site_category_all = gr.Checkbox(value=False, label="All categories", scale=1)
 
     research_site = gr.Dropdown(
         label="Site URLs (type and press Enter to add)",
         choices=all_choices,
-        value=saved_sites,
+        value=categories.get(default_cat, []),
         multiselect=True,
         allow_custom_value=True,
         elem_classes=["ext-site-tags"],
     )
+
+    with gr.Accordion("⚙️ Manage Categories", open=False, elem_classes=["ext-accordion"]):
+        with gr.Row():
+            cat_edit_select = gr.Dropdown(choices=cat_names, value=default_cat, label="Edit Category", scale=3)
+            cat_new_name = gr.Textbox(label="New name", placeholder="Rename or new category", scale=2)
+            cat_add_btn = gr.Button("Add / Rename", scale=1, min_width=80)
+            cat_del_btn = gr.Button("Delete", variant="stop", scale=1, min_width=60)
+        cat_edit_sites = gr.Dropdown(
+            label="Sites in category (edit, add, remove)",
+            choices=all_choices,
+            value=categories.get(default_cat, []),
+            multiselect=True,
+            allow_custom_value=True,
+        )
+        cat_save_btn = gr.Button("Save Category", variant="primary")
+
+    cat_status = gr.HTML("")
 
     with gr.Accordion("🔐 Session / Cookies", open=False, elem_classes=["ext-accordion"]):
         with gr.Row():
@@ -2086,9 +2433,13 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                         placeholder="e.g. Impact of AI regulation on tech companies",
                         lines=3,
                     )
-                    research_max = gr.Number(value=prefs["max_articles"], label="Articles to deep-scan", precision=0, minimum=1)
+                    with gr.Row():
+                        research_max = gr.Number(value=prefs["max_articles"], label="Articles to deep-scan", precision=0, minimum=1, scale=2)
+                        crawl_depth = gr.Radio(["Standard", "Deep"], value=prefs.get("crawl_depth", "Standard"), label="Crawl Depth", scale=2)
                     auto_keynote = gr.Checkbox(value=prefs["auto_keynote"], label="Auto-generate Keynote from top result")
-                    research_btn = gr.Button("Search Articles", variant="primary", elem_classes=["ext-generate-btn"])
+                    with gr.Row():
+                        research_btn = gr.Button("Search Articles", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
+                        research_stop = gr.Button("Stop", variant="stop", interactive=False, scale=1)
                 with gr.Column(scale=1):
                     research_log = gr.Textbox(label="Progress", lines=5, interactive=False, elem_classes=["ext-progress"])
                     research_kw  = gr.Textbox(label="Extracted Keywords", lines=1, interactive=False)
@@ -2101,7 +2452,9 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                 pick_lang2  = gr.Dropdown(["English", "zh-TW", "Japanese", "Korean", "Spanish", "French", "German", "None"], value=prefs["lang2"], label="Secondary Lang", scale=2)
                 pick_slides = gr.Number(value=prefs["slides"], label="Slides", precision=0, minimum=1, scale=1)
                 pick_theme  = gr.Radio(["Dark", "Light", "Blue"], value=prefs["theme"], label="Theme", scale=2)
-            generate_from_research = gr.Button("Generate Keynote from Article", variant="primary", elem_classes=["ext-generate-btn"])
+            with gr.Row():
+                generate_from_research = gr.Button("Generate Keynote from Article", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
+                pick_stop = gr.Button("Stop", variant="stop", interactive=False, scale=1)
             pick_log     = gr.Textbox(label="Keynote Progress", lines=5, interactive=False, elem_classes=["ext-progress"])
             pick_file    = gr.File(label="Download")
             pick_summary = gr.Textbox(label="Summary", lines=4, interactive=False, elem_classes=["ext-summary"])
@@ -2118,7 +2471,9 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                     with gr.Row():
                         theme        = gr.Radio(["Dark", "Light", "Blue"], value=prefs["theme"], label="Theme", scale=2)
                         open_keynote = gr.Checkbox(value=True, label="Auto-open file", scale=1)
-                    btn = gr.Button("Generate Keynote", variant="primary", elem_classes=["ext-generate-btn"])
+                    with gr.Row():
+                        btn = gr.Button("Generate Keynote", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
+                        keynote_stop = gr.Button("Stop", variant="stop", interactive=False, scale=1)
                 with gr.Column(scale=1):
                     log_output     = gr.Textbox(label="Progress", lines=6, interactive=False, elem_classes=["ext-progress"])
                     file_output    = gr.File(label="Download")
@@ -2160,19 +2515,128 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         domains_str = ", ".join(domains_loaded)
         return combined, f'<p style="font-size:10px;color:#8bc34a;">Loaded {count} cookies for {domains_str} from {browser}</p>'
 
-    def on_sites_change(sites):
-        if isinstance(sites, list):
+    def on_sites_change(sites, cat_name):
+        """Save site selections back to the current category."""
+        if isinstance(sites, list) and cat_name:
+            cats = load_categories()
+            clean = [s.strip() for s in sites if s and s.strip()]
+            cats[cat_name] = clean
+            save_categories(cats)
             save_sites(sites)
+            return _cat_status_html(f"✅ Saved {len(clean)} sites to \"{cat_name}\"")
+        return ""
+
+    def on_category_change(cat_name, use_all):
+        """Switch sites dropdown to show the selected category's sites."""
+        cats = load_categories()
+        if use_all:
+            # Combine all categories
+            all_sites = []
+            seen = set()
+            for sites in cats.values():
+                for s in sites:
+                    if s not in seen:
+                        all_sites.append(s)
+                        seen.add(s)
+            return gr.update(value=all_sites)
+        sites = cats.get(cat_name, [])
+        save_prefs(last_category=cat_name)
+        return gr.update(value=sites)
+
+    def on_all_categories_toggle(use_all, cat_name):
+        """Toggle between all categories and single category."""
+        return on_category_change(cat_name, use_all)
+
+    def on_cat_edit_select(cat_name):
+        """Load category sites into the edit dropdown."""
+        cats = load_categories()
+        return gr.update(value=cats.get(cat_name, []))
+
+    def _cat_status_html(msg, color="#8bc34a"):
+        return f'<p style="font-size:11px;color:{color};margin:4px 0;">{msg}</p>'
+
+    def on_cat_add_rename(edit_cat, new_name, edit_sites):
+        """Add a new category or rename an existing one."""
+        cats = load_categories()
+        new_name = (new_name or "").strip()
+        if not new_name:
+            # Just save sites to the selected category
+            if edit_cat:
+                cats[edit_cat] = [s.strip() for s in (edit_sites or []) if s and s.strip()]
+                save_categories(cats)
+            cat_names = list(cats.keys())
+            msg = _cat_status_html(f"✅ Saved {len(cats.get(edit_cat, []))} sites to \"{edit_cat}\"")
+            return (gr.update(choices=cat_names),
+                    gr.update(choices=cat_names, value=edit_cat),
+                    gr.update(value=cats.get(edit_cat, [])),
+                    msg)
+
+        if edit_cat and edit_cat in cats and new_name != edit_cat:
+            # Rename: copy sites to new name, delete old
+            cats[new_name] = cats.pop(edit_cat)
+            msg = _cat_status_html(f"✅ Renamed \"{edit_cat}\" → \"{new_name}\"")
+        elif new_name not in cats:
+            # New category
+            cats[new_name] = [s.strip() for s in (edit_sites or []) if s and s.strip()]
+            msg = _cat_status_html(f"✅ Created new category \"{new_name}\" with {len(cats[new_name])} sites")
+        else:
+            msg = _cat_status_html(f"⚠️ Category \"{new_name}\" already exists", "#e67e22")
+
+        save_categories(cats)
+        cat_names = list(cats.keys())
+        return (gr.update(choices=cat_names, value=new_name),
+                gr.update(choices=cat_names, value=new_name),
+                gr.update(value=cats.get(new_name, [])),
+                msg)
+
+    def on_cat_delete(cat_name):
+        """Delete a category."""
+        cats = load_categories()
+        if cat_name in cats and len(cats) > 1:
+            del cats[cat_name]
+            save_categories(cats)
+            msg = _cat_status_html(f"✅ Deleted category \"{cat_name}\"")
+        elif len(cats) <= 1:
+            msg = _cat_status_html(f"⚠️ Cannot delete the last category", "#e74c3c")
+        else:
+            msg = _cat_status_html(f"⚠️ Category \"{cat_name}\" not found", "#e74c3c")
+        cat_names = list(cats.keys())
+        first = cat_names[0] if cat_names else ""
+        return (gr.update(choices=cat_names, value=first),
+                gr.update(choices=cat_names, value=first),
+                gr.update(value=cats.get(first, [])),
+                gr.update(value=cats.get(first, [])),
+                msg)
+
+    def on_cat_save(cat_name, edit_sites):
+        """Save edited sites to the category."""
+        cats = load_categories()
+        sites = [s.strip() for s in (edit_sites or []) if s and s.strip()]
+        cats[cat_name] = sites
+        save_categories(cats)
+        msg = _cat_status_html(f"✅ Saved {len(sites)} sites to \"{cat_name}\"")
+        return gr.update(value=sites), msg
 
     refresh_btn.click(refresh_models, outputs=[model_input])
-    research_site.change(on_sites_change, inputs=[research_site])
+    site_category.change(on_category_change, inputs=[site_category, site_category_all], outputs=[research_site])
+    site_category_all.change(on_all_categories_toggle, inputs=[site_category_all, site_category], outputs=[research_site])
+    research_site.change(on_sites_change, inputs=[research_site, site_category], outputs=[cat_status])
     cookie_load_btn.click(on_load_cookies, inputs=[cookie_browser, research_site], outputs=[cookies_input, cookie_status])
 
-    def run_research_and_maybe_keynote(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm):
+    # Category management events
+    cat_edit_select.change(on_cat_edit_select, inputs=[cat_edit_select], outputs=[cat_edit_sites])
+    cat_add_btn.click(on_cat_add_rename, inputs=[cat_edit_select, cat_new_name, cat_edit_sites],
+                      outputs=[site_category, cat_edit_select, cat_edit_sites, cat_status])
+    cat_del_btn.click(on_cat_delete, inputs=[cat_edit_select],
+                      outputs=[site_category, cat_edit_select, cat_edit_sites, research_site, cat_status])
+    cat_save_btn.click(on_cat_save, inputs=[cat_edit_select, cat_edit_sites], outputs=[research_site, cat_status])
+
+    def run_research_and_maybe_keynote(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, depth):
         """Run research, then optionally auto-generate keynote from top result."""
         # Save preferences
+        is_deep = depth == "Deep"
         save_prefs(max_articles=int(max_articles or 30), auto_keynote=bool(auto_gen),
-                   slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm)
+                   slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm, crawl_depth=depth)
 
         # 7 outputs: research_log, research_kw, research_out, article_picker, pick_log, pick_file, pick_summary
         no_kn = gr.update()
@@ -2182,7 +2646,7 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         last_picker = no_kn
         top_selection = None
 
-        for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies):
+        for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_deep=is_deep):
             last_res_log = res_log
             last_kw = res_kw
             last_out = res_out
@@ -2242,10 +2706,21 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         for kn_log, kn_file, kn_summary in run_pipeline(url, l1, l2, num, thm, True, model, cookies, user_prompt=prompt, extra_urls=extra_urls):
             yield last_res_log, last_kw, last_out, last_picker, kn_log, kn_file, kn_summary
 
-    research_btn.click(
+    research_event = research_btn.click(
+        lambda: gr.update(interactive=True),
+        outputs=[research_stop],
+    ).then(
         run_research_and_maybe_keynote,
-        inputs=[research_prompt, research_site, research_max, model_input, cookies_input, auto_keynote, pick_lang1, pick_lang2, pick_slides, pick_theme],
+        inputs=[research_prompt, research_site, research_max, model_input, cookies_input, auto_keynote, pick_lang1, pick_lang2, pick_slides, pick_theme, crawl_depth],
         outputs=[research_log, research_kw, research_out, article_picker, pick_log, pick_file, pick_summary],
+    ).then(
+        lambda: gr.update(interactive=False),
+        outputs=[research_stop],
+    )
+    research_stop.click(
+        lambda: gr.update(interactive=False),
+        outputs=[research_stop],
+        cancels=[research_event],
     )
 
     def run_from_picker(selection, l1, l2, slides, thm, mdl, cookies, prompt):
@@ -2263,20 +2738,42 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         except Exception as e:
             yield f"❌ Error: {e}", None, ""
 
-    generate_from_research.click(
+    pick_event = generate_from_research.click(
+        lambda: gr.update(interactive=True),
+        outputs=[pick_stop],
+    ).then(
         run_from_picker,
         inputs=[article_picker, pick_lang1, pick_lang2, pick_slides, pick_theme, model_input, cookies_input, research_prompt],
         outputs=[pick_log, pick_file, pick_summary],
+    ).then(
+        lambda: gr.update(interactive=False),
+        outputs=[pick_stop],
+    )
+    pick_stop.click(
+        lambda: gr.update(interactive=False),
+        outputs=[pick_stop],
+        cancels=[pick_event],
     )
 
     def run_pipeline_and_save(url, l1, l2, slides, thm, open_kn, mdl, cookies):
         save_prefs(slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm)
         yield from run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies)
 
-    btn.click(
+    keynote_event = btn.click(
+        lambda: gr.update(interactive=True),
+        outputs=[keynote_stop],
+    ).then(
         run_pipeline_and_save,
         inputs=[url_input, lang1, lang2, num_slides, theme, open_keynote, model_input, cookies_input],
         outputs=[log_output, file_output, summary_output],
+    ).then(
+        lambda: gr.update(interactive=False),
+        outputs=[keynote_stop],
+    )
+    keynote_stop.click(
+        lambda: gr.update(interactive=False),
+        outputs=[keynote_stop],
+        cancels=[keynote_event],
     )
 
 if __name__ == "__main__":

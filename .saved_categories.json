@@ -1,0 +1,36 @@
+{
+  "Finance": [
+    "https://www.marketwatch.com",
+    "https://www.wsj.com",
+    "https://www.barrons.com",
+    "https://www.economist.com",
+    "https://www.reuters.com",
+    "https://www.investopedia.com",
+    "https://finance.yahoo.com",
+    "https://www.cnbc.com",
+    "https://www.bbc.com/news",
+    "https://www.theguardian.com",
+    "https://www.nytimes.com",
+    "https://duckduckgo.com",
+    "https://www.bing.com",
+    "https://www.google.com",
+    "https://www.barrons.com/",
+    "https://www.investors.com/",
+    "https://www.economist.com/",
+    "https://www.economist.com/topics/finance-and-economics"
+  ],
+  "Tech": [
+    "https://techcrunch.com",
+    "https://arstechnica.com",
+    "https://www.theverge.com",
+    "https://www.wired.com",
+    "https://thenextweb.com",
+    "https://venturebeat.com",
+    "https://9to5mac.com",
+    "https://www.engadget.com",
+    "https://www.zdnet.com",
+    "https://www.tomshardware.com",
+    "https://www.google.com",
+    "https://www.investors.com/"
+  ]
+}
