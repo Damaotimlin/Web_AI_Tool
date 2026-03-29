@@ -1,6 +1,6 @@
 # Web AI Tool
 
-A local-first research and presentation tool that crawls news sites, filters articles with AI, and generates dual-language Keynote/PDF presentations — all powered by local LLMs via LM Studio.
+A local-first research and presentation tool that crawls news sites, filters articles with AI, and generates dual-language Keynote/PDF presentations — powered by any local LLM with an OpenAI-compatible API.
 
 ## What It Does
 
@@ -13,7 +13,7 @@ A local-first research and presentation tool that crawls news sites, filters art
 
 | Component | Technology |
 |-----------|-----------|
-| AI Backend | [LM Studio](https://lmstudio.ai) (local LLM, OpenAI-compatible API on `localhost:1234`) |
+| AI Backend | Any OpenAI-compatible local LLM server (LM Studio, Ollama, vLLM, LocalAI, Jan, llama.cpp, Text Gen WebUI) |
 | Web Scraping | Requests + BeautifulSoup, Playwright (paywall sites), Jina Reader (fallback) |
 | Frontend | [Gradio](https://gradio.app) on `localhost:7860` |
 | Slide Export | python-pptx (PPTX) + LibreOffice headless (PDF) |
@@ -31,9 +31,13 @@ python -m playwright install chromium
 # 3. Install LibreOffice (for PDF export)
 brew install --cask libreoffice
 
-# 4. Start LM Studio
-#    - Enable Local Server on port 1234
-#    - Load one or two models (see Model Routing below)
+# 4. Start your local AI provider (any one of these):
+#    - LM Studio → enable Local Server on port 1234
+#    - Ollama → runs on port 11434 by default
+#    - vLLM → runs on port 8000 by default
+#    - LocalAI / llama.cpp → port 8080
+#    - Jan → port 1337
+#    Select your provider in the app's "AI Provider" dropdown
 
 # 5. Run the app
 python app.py
@@ -115,9 +119,26 @@ You can verify cookie isolation by running:
 python test_cookie_sandbox.py
 ```
 
+## Supported AI Providers
+
+The tool works with any local LLM server that exposes an OpenAI-compatible `/v1/chat/completions` API. Select your provider from the dropdown — the endpoint URL and port are auto-filled:
+
+| Provider | Default Port | Notes |
+|----------|-------------|-------|
+| LM Studio | 1234 | Enable "Local Server" in settings |
+| Ollama | 11434 | `ollama serve` — models via `ollama pull` |
+| vLLM | 8000 | `vllm serve <model>` |
+| LocalAI | 8080 | Docker or binary install |
+| Jan | 1337 | Enable "Local API Server" in settings |
+| llama.cpp | 8080 | `llama-server -m <model>` |
+| Text Gen WebUI | 5000 | oobabooga with API extension enabled |
+| Custom | any | Enter any URL manually |
+
+The selected provider and URL are saved between sessions.
+
 ## Model Routing
 
-The tool supports a **2-stage pipeline** when two models are loaded in LM Studio:
+The tool supports a **2-stage pipeline** when two models are loaded:
 
 | Stage | Model Pattern | Purpose |
 |-------|--------------|---------|
@@ -149,6 +170,7 @@ Prompts enforce consistent number formatting:
 
 All preferences are auto-saved between sessions:
 
+- AI provider and endpoint URL
 - Language selections
 - Slide count
 - Theme
@@ -161,6 +183,6 @@ All preferences are auto-saved between sessions:
 
 - **macOS** (for Keynote integration and browser cookie access)
 - **Python 3.10+**
-- **LM Studio** running on port 1234 with at least one model loaded
+- **Local LLM server** — any OpenAI-compatible provider (LM Studio, Ollama, vLLM, LocalAI, Jan, llama.cpp, or Text Gen WebUI)
 - **LibreOffice** (for PDF export) — `brew install --cask libreoffice`
 - **Chrome** (optional, for paywall cookie extraction)
