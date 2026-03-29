@@ -2280,41 +2280,25 @@ body {
     padding: 0 !important;
 }
 
-/* ── Progress log ── */
+/* ── Progress log — minimal overrides, preserve Gradio streaming flash ── */
 @keyframes border-pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(139,195,74,0), inset 0 0 0 0 rgba(139,195,74,0); }
-    50%  { box-shadow: 0 0 10px 2px rgba(139,195,74,0.35), inset 0 0 4px 0 rgba(139,195,74,0.1); }
-    100% { box-shadow: 0 0 0 0 rgba(139,195,74,0), inset 0 0 0 0 rgba(139,195,74,0); }
-}
-.ext-progress {
-    position: relative !important;
-    border-radius: 5px !important;
+    0%   { box-shadow: 0 0 0 0 rgba(139,195,74,0); }
+    50%  { box-shadow: 0 0 10px 2px rgba(139,195,74,0.35); }
+    100% { box-shadow: 0 0 0 0 rgba(139,195,74,0); }
 }
 .ext-progress textarea {
-    background: #1a1a1a !important;
-    color: #8bc34a !important;
     font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace !important;
-    font-size: 10.5px !important;
+    font-size: 11px !important;
     line-height: 1.5 !important;
-    border: 1.5px solid #2a2a2a !important;
-    border-radius: 5px !important;
-    padding: 6px 8px !important;
 }
-/* Flash only the outer glow, not the text */
 .ext-progress.ext-active {
     animation: border-pulse 1.5s ease-in-out infinite !important;
-    border-radius: 5px !important;
 }
 
 /* ── Summary / results ── */
 .ext-summary textarea {
-    background: #1a1a1a !important;
-    color: #ccc !important;
     font-size: 11.5px !important;
     line-height: 1.5 !important;
-    border: 1px solid #2a2a2a !important;
-    border-radius: 5px !important;
-    padding: 6px 8px !important;
 }
 
 /* ── File download ── */
@@ -2421,6 +2405,8 @@ progress_js = """
             const wrapper = ta.closest('.ext-progress');
             if (!wrapper) return;
             if (ta.value && ta.value.trim()) {
+                // Auto-scroll to bottom
+                ta.scrollTop = ta.scrollHeight;
                 wrapper.classList.add('ext-active');
                 clearTimeout(wrapper._pulseTimer);
                 wrapper._pulseTimer = setTimeout(() => {
@@ -2556,10 +2542,9 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
                     with gr.Row():
                         research_btn = gr.Button("Search Articles", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
                         research_stop = gr.Button("Stop", variant="stop", interactive=False, scale=1)
-                with gr.Column(scale=1):
-                    research_log = gr.Textbox(label="Progress", lines=5, interactive=False, elem_classes=["ext-progress"])
-                    research_kw  = gr.Textbox(label="Extracted Keywords", lines=1, interactive=False)
-                    research_out = gr.Textbox(label="Matching Articles", lines=10, interactive=False, elem_classes=["ext-summary"])
+            research_log = gr.Textbox(label="Progress", lines=8, interactive=False, elem_classes=["ext-progress"])
+            research_kw  = gr.Textbox(label="Extracted Keywords", lines=1, interactive=False)
+            research_out = gr.Textbox(label="Matching Articles", lines=10, interactive=False, elem_classes=["ext-summary"])
 
             gr.HTML('<div class="ext-section"></div>')
             article_picker = gr.Dropdown(label="Select article for Keynote", choices=[], interactive=True)
