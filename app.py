@@ -48,6 +48,9 @@ class SharedProgress:
         self._state = {
             "research_log": "", "research_kw": "", "research_out": "",
             "pick_log": "", "keynote_log": "",
+            "pick_file": None, "pick_summary": "",
+            "keynote_file": None, "keynote_summary": "",
+            "picker_choices": [], "picker_value": "",
             "running": None,  # "research" | "pick" | "keynote" | None
         }
         self._version = 0  # bumped on every update so poll can detect changes
@@ -69,11 +72,13 @@ class SharedProgress:
         """Clear progress for a pipeline about to start."""
         with self._lock:
             if pipeline == "research":
-                self._state.update(research_log="", research_kw="", research_out="", pick_log="")
+                self._state.update(research_log="", research_kw="", research_out="",
+                                   pick_log="", pick_file=None, pick_summary="",
+                                   picker_choices=[], picker_value="")
             elif pipeline == "pick":
-                self._state.update(pick_log="")
+                self._state.update(pick_log="", pick_file=None, pick_summary="")
             elif pipeline == "keynote":
-                self._state.update(keynote_log="")
+                self._state.update(keynote_log="", keynote_file=None, keynote_summary="")
             self._state["running"] = pipeline
             self._version += 1
 
@@ -3095,22 +3100,27 @@ with gr.Blocks(title="Web AI Tool") as app:
         """Return current progress if changed, otherwise skip update."""
         state, ver = _progress.snapshot()
         if ver == last_ver:
-            # No change — return no_update for everything to avoid flicker
-            return (gr.update(), gr.update(), gr.update(),
-                    gr.update(), gr.update(), ver)
-        running = state.get("running")
-        # Only push fields relevant to the active pipeline
+            nu = gr.update()
+            return nu, nu, nu, nu, nu, nu, nu, nu, nu, nu, ver
+        # Push all synced fields
         r_log = gr.update(value=state["research_log"]) if state["research_log"] else gr.update()
         r_kw = gr.update(value=state["research_kw"]) if state["research_kw"] else gr.update()
         r_out = gr.update(value=state["research_out"]) if state["research_out"] else gr.update()
+        picker = gr.update(choices=state["picker_choices"], value=state["picker_value"]) if state["picker_choices"] else gr.update()
         p_log = gr.update(value=state["pick_log"]) if state["pick_log"] else gr.update()
+        p_file = gr.update(value=state["pick_file"]) if state["pick_file"] else gr.update()
+        p_sum = gr.update(value=state["pick_summary"]) if state["pick_summary"] else gr.update()
         k_log = gr.update(value=state["keynote_log"]) if state["keynote_log"] else gr.update()
-        return r_log, r_kw, r_out, p_log, k_log, ver
+        k_file = gr.update(value=state["keynote_file"]) if state["keynote_file"] else gr.update()
+        k_sum = gr.update(value=state["keynote_summary"]) if state["keynote_summary"] else gr.update()
+        return r_log, r_kw, r_out, picker, p_log, p_file, p_sum, k_log, k_file, k_sum, ver
 
     sync_timer.tick(
         _poll_progress,
         inputs=[_last_poll_version],
-        outputs=[research_log, research_kw, research_out, pick_log, log_output, _last_poll_version],
+        outputs=[research_log, research_kw, research_out, article_picker,
+                 pick_log, pick_file, pick_summary,
+                 log_output, file_output, summary_output, _last_poll_version],
     )
 
     # ── Model auto-refresh timer (bound after handlers defined) ──
@@ -3315,107 +3325,115 @@ with gr.Blocks(title="Web AI Tool") as app:
                       outputs=[site_category, cat_edit_select, cat_edit_sites, research_site, cat_status])
     cat_save_btn.click(on_cat_save, inputs=[cat_edit_select, cat_edit_sites], outputs=[research_site, cat_status])
 
+    def _research_worker(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, is_deep, sf):
+        """Background thread: runs research + optional keynote. Updates _progress throughout."""
+        global _active_stop_flag
+        try:
+            for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_deep=is_deep, stop_flag=sf):
+                if sf.stopped:
+                    break
+                _progress.update(research_log=res_log, research_kw=res_kw, research_out=res_out)
+                if isinstance(picker_update, dict):
+                    if picker_update.get("value"):
+                        _progress.update(picker_value=picker_update["value"])
+                    if picker_update.get("choices"):
+                        _progress.update(picker_choices=picker_update["choices"])
+
+            if sf.stopped:
+                _progress.update(research_log=_progress.get("research_log") + "\n\n🛑 Stopped by user")
+                return
+
+            if not auto_gen:
+                return
+
+            top_selection = _progress.get("picker_value")
+            if not top_selection or "|" not in top_selection:
+                _progress.update(research_log=_progress.get("research_log") + "\n\n⚠️ Auto-generate: no article found")
+                return
+
+            last_pipe = top_selection.rfind("|")
+            url = top_selection[last_pipe + 1:].strip()
+            title = top_selection[:last_pipe].strip()
+            if not url.startswith("http"):
+                _progress.update(research_log=_progress.get("research_log") + f"\n\n⚠️ Invalid URL: {url}")
+                return
+
+            num = int(slides or 10)
+
+            # Gather related articles
+            extra_urls = []
+            top_domain = urlparse(normalize_url(url)).netloc
+            domain_counts = {top_domain: 1}
+            for r in _research_results:
+                if r.get("url") == url:
+                    continue
+                r_url = resolve_google_news_url(r.get("url", ""))
+                r_domain = urlparse(normalize_url(r_url)).netloc.removeprefix("www.")
+                if domain_counts.get(r_domain, 0) >= 2:
+                    continue
+                extra_urls.append(r_url)
+                domain_counts[r_domain] = domain_counts.get(r_domain, 0) + 1
+                if len(extra_urls) >= 6:
+                    break
+
+            combine_msg = f" + {len(extra_urls)} related" if extra_urls else ""
+            _progress.update(
+                research_log=_progress.get("research_log") + f"\n\n🚀 Auto-generating Keynote from: {title[:60]}{combine_msg}...",
+                pick_log=f"🚀 Starting Keynote generation...\n📎 {title[:70]}{combine_msg}\n🔗 {url}",
+            )
+
+            for kn_log, kn_file, kn_summary in run_pipeline(url, l1, l2, num, thm, True, model, cookies, user_prompt=prompt, extra_urls=extra_urls, stop_flag=sf):
+                if sf.stopped:
+                    break
+                _progress.update(pick_log=kn_log, pick_file=kn_file, pick_summary=kn_summary or "")
+
+            if sf.stopped:
+                _progress.update(pick_log=_progress.get("pick_log") + "\n\n🛑 Stopped by user")
+
+        except Exception as e:
+            _progress.update(research_log=_progress.get("research_log") + f"\n\n❌ Error: {e}")
+        finally:
+            _active_stop_flag = None
+            _progress.finish()
+
     def run_research_and_maybe_keynote(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, depth):
-        """Run research, then optionally auto-generate keynote from top result."""
+        """Start research in background thread. Generator polls shared state."""
         global _active_stop_flag
         sf = StopFlag()
         _active_stop_flag = sf
         _progress.clear("research")
 
-        # Save preferences
         is_deep = depth == "Deep"
         save_prefs(max_articles=int(max_articles or 30), auto_keynote=bool(auto_gen),
                    slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm, crawl_depth=depth)
 
-        # 7 outputs: research_log, research_kw, research_out, article_picker, pick_log, pick_file, pick_summary
-        no_kn = gr.update()
-        last_res_log = ""
-        last_kw = ""
-        last_out = ""
-        last_picker = no_kn
-        top_selection = None
+        thread = threading.Thread(target=_research_worker, args=(
+            prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, is_deep, sf,
+        ), daemon=True)
+        thread.start()
 
-        try:
-            for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_deep=is_deep, stop_flag=sf):
-                sf.check()
-                last_res_log = res_log
-                last_kw = res_kw
-                last_out = res_out
-                last_picker = picker_update
-                _progress.update(research_log=res_log, research_kw=res_kw, research_out=res_out)
-                # Capture the top selection from the final picker update
-                if isinstance(picker_update, dict) and picker_update.get("value"):
-                    top_selection = picker_update["value"]
-                yield res_log, res_kw, res_out, picker_update, no_kn, no_kn, no_kn
-        except GeneratorExit:
-            last_res_log += "\n\n🛑 Stopped by user"
-            _progress.update(research_log=last_res_log)
-            _progress.finish()
-            yield last_res_log, last_kw, last_out, last_picker, no_kn, no_kn, no_kn
-            return
-        finally:
-            _active_stop_flag = None
+        # Poll shared state and yield to the triggering client
+        last_ver = 0
+        while thread.is_alive() or _progress.get("running"):
+            state, ver = _progress.snapshot()
+            if ver != last_ver:
+                last_ver = ver
+                picker = gr.update()
+                if state["picker_choices"]:
+                    picker = gr.update(choices=state["picker_choices"], value=state.get("picker_value", ""))
+                yield (state["research_log"], state["research_kw"], state["research_out"],
+                       picker, state["pick_log"] or gr.update(),
+                       state["pick_file"] or gr.update(), state["pick_summary"] or gr.update())
+            sf._event.wait(0.5)  # sleep 0.5s but wake immediately if stopped
 
-        if not auto_gen:
-            _progress.finish()
-            return
-
-        # Auto-generate from top article
-        if not top_selection or "|" not in top_selection:
-            last_res_log += "\n\n⚠️ Auto-generate: no article found to generate from"
-            _progress.update(research_log=last_res_log)
-            _progress.finish()
-            yield last_res_log, last_kw, last_out, last_picker, "⚠️ No article to generate from", no_kn, no_kn
-            return
-
-        last_pipe = top_selection.rfind("|")
-        url = top_selection[last_pipe + 1:].strip()
-        title = top_selection[:last_pipe].strip()
-        if not url.startswith("http"):
-            last_res_log += f"\n\n⚠️ Auto-generate: invalid URL extracted: {url}"
-            _progress.update(research_log=last_res_log)
-            _progress.finish()
-            yield last_res_log, last_kw, last_out, last_picker, f"⚠️ Invalid URL: {url}", no_kn, no_kn
-            return
-
-        num = int(slides or 10)
-
-        # Gather top fetchable articles from research results
-        extra_urls = []
-        top_domain = urlparse(normalize_url(url)).netloc
-        domain_counts = {top_domain: 1}
-        max_per_domain = 2
-        max_extras = 6
-        for r in _research_results:
-            if r.get("url") == url:
-                continue
-            r_url = r.get("url", "")
-            r_domain = urlparse(normalize_url(r_url)).netloc.removeprefix("www.")
-            # Resolve Google News URLs to actual article URLs
-            r_url = resolve_google_news_url(r_url)
-            r_domain = urlparse(normalize_url(r_url)).netloc.removeprefix("www.")
-            # Skip unfetchable
-            # Allow up to max_per_domain articles from same domain
-            if domain_counts.get(r_domain, 0) >= max_per_domain:
-                continue
-            extra_urls.append(r_url)
-            domain_counts[r_domain] = domain_counts.get(r_domain, 0) + 1
-            if len(extra_urls) >= max_extras:
-                break
-
-        # Show transition in both logs
-        combine_msg = f" + {len(extra_urls)} related" if extra_urls else ""
-        last_res_log += f"\n\n🚀 Auto-generating Keynote from: {title[:60]}{combine_msg}..."
-        pick_msg = f"🚀 Starting Keynote generation...\n📎 {title[:70]}{combine_msg}\n🔗 {url}"
-        _progress.update(research_log=last_res_log, pick_log=pick_msg)
-        yield last_res_log, last_kw, last_out, last_picker, pick_msg, no_kn, no_kn
-
-        for kn_log, kn_file, kn_summary in run_pipeline(url, l1, l2, num, thm, True, model, cookies, user_prompt=prompt, extra_urls=extra_urls, stop_flag=sf):
-            sf.check()
-            _progress.update(pick_log=kn_log)
-            yield last_res_log, last_kw, last_out, last_picker, kn_log, kn_file, kn_summary
-
-        _progress.finish()
+        # Final yield with complete state
+        state, _ = _progress.snapshot()
+        picker = gr.update()
+        if state["picker_choices"]:
+            picker = gr.update(choices=state["picker_choices"], value=state.get("picker_value", ""))
+        yield (state["research_log"], state["research_kw"], state["research_out"],
+               picker, state["pick_log"] or gr.update(),
+               state["pick_file"] or gr.update(), state["pick_summary"] or gr.update())
 
     research_event = research_btn.click(
         lambda: gr.update(interactive=True),
@@ -3443,34 +3461,55 @@ with gr.Blocks(title="Web AI Tool") as app:
         cancels=[research_event],
     )
 
+    def _pick_worker(url, l1, l2, slides, thm, mdl, cookies, prompt, sf):
+        """Background thread for picker pipeline."""
+        global _active_stop_flag
+        try:
+            for log, fobj, summary in run_pipeline(url, l1, l2, int(slides), thm, True, mdl, cookies, user_prompt=prompt, stop_flag=sf):
+                if sf.stopped:
+                    break
+                _progress.update(pick_log=log, pick_file=fobj, pick_summary=summary or "")
+            if sf.stopped:
+                _progress.update(pick_log=_progress.get("pick_log") + "\n\n🛑 Stopped by user")
+        except Exception as e:
+            _progress.update(pick_log=_progress.get("pick_log") + f"\n\n❌ Error: {e}")
+        finally:
+            _active_stop_flag = None
+            _progress.finish()
+
     def run_from_picker(selection, l1, l2, slides, thm, mdl, cookies, prompt):
-        """Extract URL from picker selection and run keynote pipeline."""
+        """Start keynote pipeline in background thread."""
         global _active_stop_flag
         sf = StopFlag()
         _active_stop_flag = sf
         _progress.clear("pick")
-        try:
-            if not selection or "|" not in selection:
-                yield "❌ No article selected — run Research first", None, ""
-                _progress.finish()
-                return
-            last_pipe = selection.rfind("|")
-            url = selection[last_pipe + 1:].strip()
-            if not url.startswith("http"):
-                yield f"❌ Invalid URL: {url}", None, ""
-                _progress.finish()
-                return
-            for log, fobj, summary in run_pipeline(url, l1, l2, int(slides), thm, True, mdl, cookies, user_prompt=prompt, stop_flag=sf):
-                _progress.update(pick_log=log)
-                yield log, fobj, summary
-        except GeneratorExit:
-            _progress.update(pick_log="🛑 Stopped by user")
-            yield "🛑 Stopped by user", None, ""
-        except Exception as e:
-            yield f"❌ Error: {e}", None, ""
-        finally:
-            _active_stop_flag = None
+
+        if not selection or "|" not in selection:
+            _progress.update(pick_log="❌ No article selected — run Research first")
             _progress.finish()
+            yield "❌ No article selected — run Research first", None, ""
+            return
+        last_pipe = selection.rfind("|")
+        url = selection[last_pipe + 1:].strip()
+        if not url.startswith("http"):
+            _progress.update(pick_log=f"❌ Invalid URL: {url}")
+            _progress.finish()
+            yield f"❌ Invalid URL: {url}", None, ""
+            return
+
+        thread = threading.Thread(target=_pick_worker, args=(url, l1, l2, slides, thm, mdl, cookies, prompt, sf), daemon=True)
+        thread.start()
+
+        last_ver = 0
+        while thread.is_alive() or _progress.get("running"):
+            state, ver = _progress.snapshot()
+            if ver != last_ver:
+                last_ver = ver
+                yield state["pick_log"], state["pick_file"], state["pick_summary"]
+            sf._event.wait(0.5)
+
+        state, _ = _progress.snapshot()
+        yield state["pick_log"], state["pick_file"], state["pick_summary"]
 
     pick_event = generate_from_research.click(
         lambda: gr.update(interactive=True),
@@ -3493,22 +3532,42 @@ with gr.Blocks(title="Web AI Tool") as app:
         cancels=[pick_event],
     )
 
+    def _keynote_worker(url, l1, l2, slides, thm, open_kn, mdl, cookies, sf):
+        """Background thread for keynote pipeline."""
+        global _active_stop_flag
+        try:
+            for log, fobj, summary in run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies, stop_flag=sf):
+                if sf.stopped:
+                    break
+                _progress.update(keynote_log=log, keynote_file=fobj, keynote_summary=summary or "")
+            if sf.stopped:
+                _progress.update(keynote_log=_progress.get("keynote_log") + "\n\n🛑 Stopped by user")
+        except Exception as e:
+            _progress.update(keynote_log=_progress.get("keynote_log") + f"\n\n❌ Error: {e}")
+        finally:
+            _active_stop_flag = None
+            _progress.finish()
+
     def run_pipeline_and_save(url, l1, l2, slides, thm, open_kn, mdl, cookies):
         global _active_stop_flag
         sf = StopFlag()
         _active_stop_flag = sf
         _progress.clear("keynote")
         save_prefs(slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm)
-        try:
-            for log, fobj, summary in run_pipeline(url, l1, l2, int(slides), thm, open_kn, mdl, cookies, stop_flag=sf):
-                _progress.update(keynote_log=log)
-                yield log, fobj, summary
-        except GeneratorExit:
-            _progress.update(keynote_log="🛑 Stopped by user")
-            yield "🛑 Stopped by user", None, ""
-        finally:
-            _active_stop_flag = None
-            _progress.finish()
+
+        thread = threading.Thread(target=_keynote_worker, args=(url, l1, l2, slides, thm, open_kn, mdl, cookies, sf), daemon=True)
+        thread.start()
+
+        last_ver = 0
+        while thread.is_alive() or _progress.get("running"):
+            state, ver = _progress.snapshot()
+            if ver != last_ver:
+                last_ver = ver
+                yield state["keynote_log"], state["keynote_file"], state["keynote_summary"]
+            sf._event.wait(0.5)
+
+        state, _ = _progress.snapshot()
+        yield state["keynote_log"], state["keynote_file"], state["keynote_summary"]
 
     keynote_event = btn.click(
         lambda: gr.update(interactive=True),
