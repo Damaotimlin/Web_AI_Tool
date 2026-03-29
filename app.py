@@ -2081,38 +2081,59 @@ def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cook
         yield "\n".join(logs), None, ""
 
 
-def list_output_files() -> list[list]:
-    """Return rows for the output files table: [selected, filename, type, size, date, path]."""
-    rows = []
+def list_output_filenames() -> list[str]:
+    """Return list of output filenames for dropdown."""
     if not os.path.isdir(OUTPUT_DIR):
-        return rows
+        return []
+    names = []
     for fname in sorted(os.listdir(OUTPUT_DIR), key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)), reverse=True):
         fpath = os.path.join(OUTPUT_DIR, fname)
-        if not os.path.isfile(fpath):
-            continue
-        ext = os.path.splitext(fname)[1].lower()
-        if ext not in (".pptx", ".pdf"):
-            continue
-        size_bytes = os.path.getsize(fpath)
-        if size_bytes < 1024:
-            size_str = f"{size_bytes} B"
-        elif size_bytes < 1024 * 1024:
-            size_str = f"{size_bytes / 1024:.1f} KB"
-        else:
-            size_str = f"{size_bytes / (1024 * 1024):.1f} MB"
-        mtime = datetime.fromtimestamp(os.path.getmtime(fpath)).strftime("%Y-%m-%d %H:%M")
-        rows.append([False, fname, ext.lstrip(".").upper(), size_str, mtime, fpath])
-    return rows
+        if os.path.isfile(fpath) and os.path.splitext(fname)[1].lower() in (".pptx", ".pdf"):
+            names.append(fname)
+    return names
+
+
 
 
 # --- UI ---
 css = """
-/* === Web AI Tool — compact dark === */
+/* === Web AI Tool — force dark mode === */
+:root {
+    color-scheme: dark !important;
+}
 *, *::before, *::after { box-sizing: border-box; }
 
+html {
+    background: #1a1a1a !important;
+    color-scheme: dark !important;
+}
 body {
     font-family: 'Segoe UI', 'SF Pro Text', -apple-system, Roboto, sans-serif;
-    background: #1a1a1a;
+    background: #1a1a1a !important;
+    color: #e0e0e0 !important;
+}
+/* Force dark on all Gradio wrappers */
+.gradio-container,
+.gradio-container *,
+.main, .app, .contain,
+div[class*="svelte"],
+div[class*="gradio"] {
+    color-scheme: dark !important;
+}
+/* Kill any white backgrounds from Gradio/Safari defaults */
+.gradio-container div,
+.gradio-container section,
+.gradio-container form,
+.gradio-container fieldset,
+.gradio-container details,
+.gradio-container summary {
+    background-color: transparent;
+}
+.block, .gr-block, .gr-box, .gr-panel,
+div[class*="block"], div[class*="panel"],
+div[class*="group"], div[class*="form"] {
+    background: transparent !important;
+    border-color: #3a3a3a !important;
 }
 
 /* ── Container ── */
@@ -2439,54 +2460,60 @@ body {
 }
 
 /* ── Output files panel — scrollable container ── */
+/* ── Output files panel ── */
 .ext-output-panel {
-    border: 1px solid #333 !important;
+    border: 1px solid #3a3a3a !important;
     background: #252525 !important;
     border-radius: 8px !important;
-    margin: 6px 0 !important;
+    margin: 8px 0 !important;
     padding: 0 !important;
-    max-height: 420px !important;
+    max-height: 400px !important;
     overflow-y: auto !important;
     overflow-x: hidden !important;
 }
 .ext-output-header {
-    font-size: 13px !important;
+    font-size: 12px !important;
     font-weight: 600 !important;
-    color: #ccc !important;
-    padding: 10px 12px 4px !important;
-    position: sticky !important;
-    top: 0 !important;
-    background: #252525 !important;
-    z-index: 5 !important;
-    border-bottom: 1px solid #333 !important;
-    margin-bottom: 4px !important;
+    color: #aaa !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.5px !important;
+    padding: 10px 4px 6px !important;
+    margin: 0 !important;
 }
-/* Action bar — floating toolbar when files selected */
+/* Confirm bar hidden by default */
+#output-confirm-bar { display: none !important; }
+#output-confirm-bar.ext-visible { display: flex !important; }
+
 .ext-action-bar {
-    padding: 6px 8px !important;
-    margin: 4px 8px !important;
-    background: #333 !important;
-    border: 1px solid #555 !important;
-    border-radius: 8px !important;
+    padding: 6px 0 !important;
+    margin: 0 !important;
     gap: 6px !important;
     flex-direction: row !important;
     justify-content: center !important;
+    align-items: center !important;
 }
 .ext-action-bar button {
     font-size: 12px !important;
-    padding: 6px 14px !important;
+    font-weight: 500 !important;
+    padding: 7px 16px !important;
     border-radius: 6px !important;
-    min-height: 32px !important;
+    min-height: 34px !important;
     margin: 0 !important;
+    border: 1px solid #444 !important;
+    background: #333 !important;
+    color: #ddd !important;
+    cursor: pointer !important;
+    transition: background 0.15s !important;
 }
-.ext-output-panel table {
-    font-size: 11px !important;
+.ext-action-bar button:hover {
+    background: #3e3e3e !important;
 }
-.ext-output-panel table th {
-    position: sticky !important;
-    top: 76px !important;
-    background: #2b2b2b !important;
-    z-index: 3 !important;
+.ext-action-bar button:last-child {
+    border-color: #633 !important;
+    color: #e57373 !important;
+}
+.ext-action-bar button:last-child:hover {
+    background: #3a2020 !important;
 }
 
 /* ── Hide footer ── */
@@ -2745,30 +2772,6 @@ footer { display: none !important; }
         margin: 10px 0 8px !important;
     }
 
-    /* ── Dataframe / table — constrain to viewport ── */
-    table, .table-wrap, .dataframe, [class*="dataframe"] {
-        display: block !important;
-        overflow-x: auto !important;
-        max-width: 100% !important;
-        -webkit-overflow-scrolling: touch;
-    }
-    /* Hide Path column (6th col) — not useful on mobile */
-    table th:nth-child(6),
-    table td:nth-child(6) {
-        display: none !important;
-    }
-    /* Truncate filename column */
-    table td:nth-child(2) {
-        max-width: 40vw !important;
-        overflow: hidden !important;
-        text-overflow: ellipsis !important;
-        white-space: nowrap !important;
-    }
-    table td, table th {
-        font-size: 11px !important;
-        padding: 4px 6px !important;
-    }
-
     /* ── Hide Gradio branding/extra chrome ── */
     .built-with { display: none !important; }
     .gradio-container > .flex > .flex:empty { display: none !important; }
@@ -2835,6 +2838,20 @@ progress_js = """
         tc.name = 'theme-color'; tc.content = '#1a1a1a';
         document.head.appendChild(tc);
     }
+    // Force dark mode for Safari — inject early to prevent white flash
+    if (!document.querySelector('#force-dark-mode')) {
+        const ds = document.createElement('style');
+        ds.id = 'force-dark-mode';
+        ds.textContent = `
+            :root { color-scheme: dark !important; }
+            html, body { background: #1a1a1a !important; color: #e0e0e0 !important; }
+            .block, .gr-block, .gr-box, .gr-panel,
+            div[class*="block"], div[class*="panel"],
+            div[class*="group"], div[class*="form"],
+            .gradio-container div { background-color: transparent; }
+        `;
+        document.head.insertBefore(ds, document.head.firstChild);
+    }
 
     // Mobile: strip Gradio wrapper padding and lock width
     if (/Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) {
@@ -2850,7 +2867,19 @@ progress_js = """
         document.head.appendChild(lockStyle);
     }
 
+
+    // Fix Gradio's orphaned label[for] attributes (suppresses browser warning)
+    function fixOrphanedLabels() {
+        document.querySelectorAll('label[for]').forEach(label => {
+            if (!document.getElementById(label.getAttribute('for'))) {
+                label.removeAttribute('for');
+            }
+        });
+    }
+    fixOrphanedLabels();
+
     const observer = new MutationObserver(() => {
+        fixOrphanedLabels();
         // Progress bar pulse
         document.querySelectorAll('.ext-progress textarea').forEach(ta => {
             const wrapper = ta.closest('.ext-progress');
@@ -3038,25 +3067,24 @@ with gr.Blocks(title="Web AI Tool") as app:
                     file_output    = gr.File(label="Download")
                     summary_output = gr.Textbox(label="Summary", lines=5, interactive=False, elem_classes=["ext-summary"])
 
-    # ── Output Files Table ──
+    # ── Output Files ──
     gr.HTML('<div class="ext-section"></div>')
     with gr.Group(elem_classes=["ext-output-panel"]):
         gr.HTML('<div class="ext-output-header">📁 Output Files</div>')
-        output_table = gr.Dataframe(
-            headers=["", "Filename", "Type", "Size", "Date", "Path"],
-            datatype=["bool", "str", "str", "str", "str", "str"],
-            col_count=(6, "fixed"),
-            value=list_output_files(),
+        output_file_picker = gr.Dropdown(
+            label="Select file",
+            choices=list_output_filenames(),
             interactive=True,
-            column_widths=["40px", "40%", "8%", "10%", "15%", "27%"],
-            wrap=True,
         )
-        # Action bar — appears when files are selected
-        output_status = gr.HTML("")
-        with gr.Row(elem_classes=["ext-action-bar"], visible=False) as output_actions:
+        with gr.Row(elem_classes=["ext-action-bar"]):
+            output_refresh_btn = gr.Button("🔄 Refresh", scale=1)
             output_download_btn = gr.Button("📥 Download", scale=1)
-            output_open_btn = gr.Button("📂 Open", scale=1)
+            output_open_btn = gr.Button("📂 Open on Mac", scale=1)
             output_delete_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
+        output_status = gr.HTML("")
+        with gr.Row(elem_classes=["ext-action-bar"], visible=False) as output_confirm_row:
+            output_confirm_btn = gr.Button("⚠️ Confirm Delete", variant="stop", scale=1)
+            output_cancel_btn = gr.Button("Cancel", scale=1)
         output_download = gr.File(label="Download", visible=False)
 
     # ── Live sync timer — polls shared progress so all clients stay updated ──
@@ -3503,91 +3531,60 @@ with gr.Blocks(title="Web AI Tool") as app:
         cancels=[keynote_event],
     )
 
-    # ── Output Files Table handlers ──
-    def _refresh_output_table():
-        return gr.update(value=list_output_files()), ""
+    # ── Output Files handlers ──
+    def _refresh_file_list():
+        return gr.update(choices=list_output_filenames(), value=None), ""
 
-    def _get_selected_paths(table_data):
-        """Extract file paths from selected (checked) rows."""
-        selected = []
-        if table_data is None:
-            return selected
-        for row in table_data.values.tolist() if hasattr(table_data, 'values') else table_data:
-            if row[0]:  # checkbox column
-                selected.append(row[5])  # path column
-        return selected
+    def _resolve_picked(fname):
+        if not fname:
+            return None
+        fpath = os.path.join(OUTPUT_DIR, fname)
+        return fpath if os.path.exists(fpath) else None
 
-    def _download_selected(table_data):
-        """Return selected files for browser download (works on mobile/remote)."""
-        paths = _get_selected_paths(table_data)
-        if not paths:
-            return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>', gr.update(visible=False, value=None)
-        existing = [p for p in paths if os.path.exists(p)]
-        if not existing:
-            return gr.update(value=list_output_files()), '<span style="color:#e74c3c">❌ Selected files not found</span>', gr.update(visible=False, value=None)
-        names = ", ".join(os.path.basename(p) for p in existing)
-        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Ready to download: {names}</span>', gr.update(visible=True, value=existing if len(existing) > 1 else existing[0])
+    def _download_file(fname):
+        fpath = _resolve_picked(fname)
+        if not fpath:
+            return '<span style="color:#e67e22">⚠️ No file selected</span>', gr.update(visible=False, value=None)
+        return f'<span style="color:#2ecc71">✅ {fname}</span>', gr.update(visible=True, value=fpath)
 
-    def _open_selected(table_data):
-        """Open selected files locally on the Mac."""
-        paths = _get_selected_paths(table_data)
-        if not paths:
-            return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>'
-        existing = [p for p in paths if os.path.exists(p)]
-        if not existing:
-            return gr.update(value=list_output_files()), '<span style="color:#e74c3c">❌ Selected files not found</span>'
-        for p in existing:
-            try:
-                subprocess.Popen(["open", p])
-            except Exception:
-                pass
-        names = ", ".join(os.path.basename(p) for p in existing)
-        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Opened on Mac: {names}</span>'
+    def _open_file(fname):
+        fpath = _resolve_picked(fname)
+        if not fpath:
+            return '<span style="color:#e67e22">⚠️ No file selected</span>'
+        subprocess.Popen(["open", fpath])
+        return f'<span style="color:#2ecc71">✅ Opened: {fname}</span>'
 
-    def _delete_selected(table_data):
-        paths = _get_selected_paths(table_data)
-        if not paths:
-            return gr.update(value=list_output_files()), '<span style="color:#e67e22">⚠️ No files selected</span>'
-        deleted = 0
-        for p in paths:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-                    deleted += 1
-            except Exception:
-                pass
-        return gr.update(value=list_output_files()), f'<span style="color:#2ecc71">✅ Deleted {deleted} file(s)</span>'
+    def _ask_delete(fname):
+        fpath = _resolve_picked(fname)
+        if not fpath:
+            return '<span style="color:#e67e22">⚠️ No file selected</span>', gr.update(visible=False)
+        return f'<span style="color:#e57373;font-size:12px;">Delete {fname}?</span>', gr.update(visible=True)
 
-    def _on_table_select(table_data):
-        """Show/hide action bar based on whether any rows are checked."""
-        paths = _get_selected_paths(table_data)
-        if paths:
-            count = len(paths)
-            label = f'<span style="color:#64b5f6;font-size:12px;">{count} file{"s" if count > 1 else ""} selected</span>'
-            return gr.update(value=label), gr.update(visible=True)
-        return gr.update(value=""), gr.update(visible=False)
+    def _cancel_delete():
+        return '', gr.update(visible=False)
 
-    output_table.change(_on_table_select, inputs=[output_table], outputs=[output_status, output_actions])
-    def _download_and_hide(table_data):
-        tbl, status, dl = _download_selected(table_data)
-        return tbl, status, dl, gr.update(visible=False)
+    def _confirm_delete(fname):
+        fpath = _resolve_picked(fname)
+        if not fpath:
+            return gr.update(), '<span style="color:#e67e22">⚠️ No file selected</span>', gr.update(visible=False)
+        try:
+            os.remove(fpath)
+            status = f'<span style="color:#2ecc71">✅ Deleted: {fname}</span>'
+        except Exception as e:
+            status = f'<span style="color:#e74c3c">❌ {e}</span>'
+        return gr.update(choices=list_output_filenames(), value=None), status, gr.update(visible=False)
 
-    def _open_and_hide(table_data):
-        tbl, status = _open_selected(table_data)
-        return tbl, status, gr.update(visible=False)
+    output_refresh_btn.click(_refresh_file_list, outputs=[output_file_picker, output_status])
+    output_download_btn.click(_download_file, inputs=[output_file_picker], outputs=[output_status, output_download])
+    output_open_btn.click(_open_file, inputs=[output_file_picker], outputs=[output_status])
+    output_delete_btn.click(_ask_delete, inputs=[output_file_picker], outputs=[output_status, output_confirm_row])
+    output_cancel_btn.click(_cancel_delete, outputs=[output_status, output_confirm_row])
+    output_confirm_btn.click(_confirm_delete, inputs=[output_file_picker], outputs=[output_file_picker, output_status, output_confirm_row])
 
-    def _delete_and_hide(table_data):
-        tbl, status = _delete_selected(table_data)
-        return tbl, status, gr.update(visible=False)
-
-    output_download_btn.click(_download_and_hide, inputs=[output_table], outputs=[output_table, output_status, output_download, output_actions])
-    output_open_btn.click(_open_and_hide, inputs=[output_table], outputs=[output_table, output_status, output_actions])
-    output_delete_btn.click(_delete_and_hide, inputs=[output_table], outputs=[output_table, output_status, output_actions])
-
-    # Auto-refresh table after any pipeline completes
-    research_event.then(_refresh_output_table, outputs=[output_table, output_status])
-    pick_event.then(_refresh_output_table, outputs=[output_table, output_status])
-    keynote_event.then(_refresh_output_table, outputs=[output_table, output_status])
+    # Auto-refresh after any pipeline completes
+    research_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
+    pick_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
+    keynote_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
 
 if __name__ == "__main__":
     app.launch(
