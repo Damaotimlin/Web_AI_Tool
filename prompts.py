@@ -17,6 +17,17 @@ Consider this context when summarizing — focus on aspects most relevant to the
 Translate and provide a comprehensive summary of the following content into {language}.
 The summary should be detailed and thorough (500-800 words). Cover all key points, data, quotes, and analysis.
 Do NOT be brief — include specific numbers, names, dates, and details from the article(s).
+
+CRITICAL — Fact vs. speculation labeling:
+- Every claim with a specific number, price, or statistic MUST be verified against the source text. Only include numbers that actually appear in the article.
+- Do NOT invent, extrapolate, or round numbers that are not explicitly stated in the source.
+- Clearly distinguish between FACTS (reported events, confirmed data) and SPECULATION (forecasts, analyst predictions, scenarios, estimates).
+- For confirmed facts, state them directly: "Oil prices rose 5% to $95/barrel on March 15."
+- For speculation/forecasts, ALWAYS attribute and label: "Analysts at Goldman Sachs project oil could reach $120 (forecast)" or "According to [source], prices may rise to... (estimate)"
+- Use labels like (forecast), (estimate), (projection), (scenario), (analyst view) for any forward-looking or unconfirmed claims.
+- If the article discusses hypothetical scenarios or simulations, explicitly mark them: "In a worst-case scenario..." or "If tensions escalate, [source] estimates..."
+- NEVER present a prediction, model output, or analyst opinion as if it were a confirmed fact.
+
 Number formatting rules (apply to ALL languages):
 - Use abbreviations for large numbers: M for million, B for billion, T for trillion (e.g. "$15B" not "$15,000,000,000", "$1.25M" not "$1,250,000")
 - For Chinese/zh-TW: follow Chinese units — use 萬 and 億 with digits (e.g. "150億美元" not "$15,000,000,000", "1,250萬" not "12,500,000")
@@ -78,6 +89,14 @@ IMPORTANT rules:
 - Each slide should have a distinct sub-topic
 - SYNTHESIZE information from ALL sources if multiple are provided
 - Number formatting: use M/B/T for large numbers ("$15B" not "$15,000,000,000", "$1.25M" not "$1,250,000"). For Chinese: use 萬/億 with digits ("150億美元", "1,250萬"). Under 1M use thousand separators ("3,500"). Always use digits, never spell out. Percentages: "7.2%" not "seven percent"
+
+CRITICAL — Fact vs. speculation:
+- Only use numbers and data that are explicitly stated in the source content. Do NOT invent or extrapolate numbers.
+- For confirmed facts, state directly: "Oil prices rose 5% to $95/barrel"
+- For forecasts, predictions, or estimates, ALWAYS add a tag: (forecast), (estimate), (projection), (analyst view)
+- Example: "Goldman Sachs projects oil could reach $120/barrel (forecast)" — NOT "Oil reaches $120/barrel"
+- If a scenario or simulation is described, prefix with "Scenario:" or "If [condition]..."
+- NEVER present speculation, analyst opinions, or model outputs as confirmed facts
 
 Content:
 {content}

@@ -14,6 +14,13 @@ from pptx.util import Inches, Pt
 from pptx.dml.color import RGBColor
 from datetime import datetime
 import prompts
+import importlib
+
+
+def get_prompts():
+    """Hot-reload prompts.py so edits take effect without restarting the server."""
+    importlib.reload(prompts)
+    return prompts
 
 
 class StopFlag:
@@ -609,11 +616,11 @@ def chat(prompt: str, model: str = "") -> str:
 
 def translate_content(content: str, language: str, model: str = "", user_prompt: str = "") -> str:
     """Translate and summarize content."""
-    return chat(prompts.translate_and_summarize(content, language, user_prompt), model)
+    return chat(get_prompts().translate_and_summarize(content, language, user_prompt), model)
 
 
 def _build_slide_prompt(content: str, language: str, num_slides: int, lang2: str = "", user_instruction: str = "", slide_context: str = "") -> str:
-    return prompts.generate_slides(content, language, num_slides, lang2, user_instruction, slide_context)
+    return get_prompts().generate_slides(content, language, num_slides, lang2, user_instruction, slide_context)
 
 
 def generate_slide_structure(content: str, language: str, num_slides: int, model: str = "", source_url: str = "", source_title: str = "", user_prompt: str = "", lang2: str = "") -> dict:
@@ -998,7 +1005,7 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
 
 def extract_keywords(prompt: str, model: str = "") -> list[str]:
     """Use AI to break down a prompt into broad search keywords."""
-    raw = chat(prompts.extract_keywords(prompt), model)
+    raw = chat(get_prompts().extract_keywords(prompt), model)
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
@@ -1583,7 +1590,7 @@ def ai_filter_titles(titles: list[dict], prompt: str, model: str = "", keywords:
 def _ai_filter_batch(titles: list[dict], prompt: str, model: str = "") -> list[dict]:
     """AI judges a single batch of titles."""
     title_list = "\n".join(f"{i}. {t['title']}" for i, t in enumerate(titles))
-    raw = chat(prompts.filter_titles(prompt, title_list), model)
+    raw = chat(get_prompts().filter_titles(prompt, title_list), model)
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     try:
         judgments = json.loads(raw)
@@ -1610,7 +1617,7 @@ def ai_score_article(url: str, prompt: str, session: requests.Session | None = N
         return {"score": 0, "reason": "Failed to fetch"}
 
     try:
-        raw = chat(prompts.score_article(prompt, content), model)
+        raw = chat(get_prompts().score_article(prompt, content), model)
         raw = raw.strip().replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         return {"score": result.get("relevance", 0), "reason": result.get("reason", "")}
@@ -1801,7 +1808,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
 
             try:
                 titles_for_grouping = "\n".join(f"{i}. {r['title']}" for i, r in enumerate(results))
-                raw = chat(prompts.group_articles(prompt, titles_for_grouping), ref_model)
+                raw = chat(get_prompts().group_articles(prompt, titles_for_grouping), ref_model)
                 raw = raw.strip().replace("```json", "").replace("```", "").strip()
                 topic_groups = json.loads(raw)
                 logs.append(f"📊 Found {len(topic_groups)} topic groups:")
@@ -2864,11 +2871,14 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         global _active_stop_flag
         if _active_stop_flag:
             _active_stop_flag.stop()
-        return gr.update(interactive=False)
+
+    def _stop_research():
+        _trigger_stop()
+        return gr.update(interactive=False), gr.update(value="🛑 Stopped by user")
 
     research_stop.click(
-        _trigger_stop,
-        outputs=[research_stop],
+        _stop_research,
+        outputs=[research_stop, research_log],
         cancels=[research_event],
     )
 
@@ -2905,9 +2915,13 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         lambda: gr.update(interactive=False),
         outputs=[pick_stop],
     )
+    def _stop_pick():
+        _trigger_stop()
+        return gr.update(interactive=False), gr.update(value="🛑 Stopped by user")
+
     pick_stop.click(
-        _trigger_stop,
-        outputs=[pick_stop],
+        _stop_pick,
+        outputs=[pick_stop, pick_log],
         cancels=[pick_event],
     )
 
@@ -2934,9 +2948,13 @@ with gr.Blocks(title="Web AI Tool", theme=gr.themes.Soft(), css=css, js=progress
         lambda: gr.update(interactive=False),
         outputs=[keynote_stop],
     )
+    def _stop_keynote():
+        _trigger_stop()
+        return gr.update(interactive=False), gr.update(value="🛑 Stopped by user")
+
     keynote_stop.click(
-        _trigger_stop,
-        outputs=[keynote_stop],
+        _stop_keynote,
+        outputs=[keynote_stop, log_output],
         cancels=[keynote_event],
     )
 
