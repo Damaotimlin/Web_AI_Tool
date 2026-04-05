@@ -1589,11 +1589,48 @@ def is_search_engine(domain: str) -> bool:
     return any(se in domain for se in SEARCH_ENGINES)
 
 
+# Domains behind Akamai/Cloudflare bot detection — skip requests, go straight to Playwright
+BOT_PROTECTED_DOMAINS = {
+    "wsj.com", "barrons.com", "marketwatch.com",
+    "ft.com", "bloomberg.com", "nytimes.com",
+    "economist.com", "washingtonpost.com",
+    "reuters.com", "forbes.com",
+}
+
+
+def _is_bot_protected(domain: str) -> bool:
+    """True if the domain (or its parent) is in BOT_PROTECTED_DOMAINS."""
+    domain = (domain or "").removeprefix("www.").lower()
+    for bp in BOT_PROTECTED_DOMAINS:
+        if domain == bp or domain.endswith("." + bp):
+            return True
+    return False
+
+
 def crawl_site_links(base_url: str, session: requests.Session | None = None, max_links: int = 80) -> list[dict]:
     """Crawl a website. Falls back to RSS/Google News if direct crawl fails."""
     base_url = normalize_url(base_url)
     parsed = urlparse(base_url)
     domain = parsed.netloc.removeprefix("www.")
+
+    # Bot-protected sites: skip the requests attempt and go straight to Playwright.
+    # Akamai/Cloudflare will 401/403 a plain requests call regardless of cookies.
+    if _is_bot_protected(domain):
+        browser_links = crawl_with_browser(base_url, max_links)
+        if browser_links:
+            return browser_links
+        # Fall through to RSS/Google News fallbacks below
+        for rss_domain, feeds in RSS_FEEDS.items():
+            if rss_domain in domain:
+                rss_links = crawl_rss_feeds(feeds, max_links)
+                if rss_links:
+                    return rss_links
+        for gn_domain in GOOGLE_NEWS_FALLBACK:
+            if gn_domain in domain:
+                gn_links = crawl_google_news(gn_domain, max_links)
+                if gn_links:
+                    return gn_links
+        raise ValueError(f"Failed to fetch {base_url}: bot-protected site, browser crawl returned no links (check Chrome login / pass human-check)")
 
     try:
         s = session or requests.Session()
@@ -1752,6 +1789,9 @@ def crawl_site_deep(base_url: str, keywords: list[str], session: requests.Sessio
     parsed = urlparse(base_url)
     domain = parsed.netloc.removeprefix("www.")
 
+    # Bot-protected sites: skip requests for the entire crawl, use Playwright everywhere
+    force_browser = _is_bot_protected(domain)
+
     s = session or requests.Session()
     for k, v in BROWSER_HEADERS.items():
         s.headers.setdefault(k, v)
@@ -1766,6 +1806,11 @@ def crawl_site_deep(base_url: str, keywords: list[str], session: requests.Sessio
     all_links: list[dict] = []
 
     def _fetch_html(url: str) -> str | None:
+        if force_browser:
+            try:
+                return _browser_fetch_html(url)
+            except Exception:
+                return None
         try:
             res = s.get(url, timeout=15)
             res.raise_for_status()
@@ -2058,14 +2103,25 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
         logs.append(f"🔑 Keywords: {kw_display}")
         yield "\n".join(logs), kw_display, "", no_update
 
-        # Crawl all sites — each with its own session/cookies
+        # Crawl all sites — each with its own session/cookies.
+        # Failed sites are pushed to the end of the queue for a retry with fresh cookies,
+        # giving the user time to log in / pass a human-check in Chrome while other sites
+        # are crawled. Each URL gets at most MAX_ATTEMPTS tries.
+        MAX_ATTEMPTS = 2
         all_links = []
         search_query = " ".join(keywords[:8])  # Use top keywords as search query
-        for site_url in url_list:
-            stop_flag.check()
-            site_domain = urlparse(normalize_url(site_url)).netloc.removeprefix("www.")
+        queue: list[tuple[str, int]] = [(u, 0) for u in url_list]
 
-            # Detect search engines — search instead of crawl
+        def _log_update(msg, _logs=logs):
+            _logs.append(msg)
+
+        while queue:
+            stop_flag.check()
+            site_url, attempts = queue.pop(0)
+            site_domain = urlparse(normalize_url(site_url)).netloc.removeprefix("www.")
+            retry_label = f" (retry {attempts})" if attempts > 0 else ""
+
+            # Detect search engines — search instead of crawl (no cookies, no retry)
             if is_search_engine(site_domain):
                 logs.append(f"🔎 Searching {site_domain} for: {search_query[:50]}...")
                 yield "\n".join(logs), kw_display, "", no_update
@@ -2076,32 +2132,38 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
                 except Exception as e:
                     logs.append(f"  ⚠️ Search failed: {e}")
                     _research_issues.append(f"Search {site_domain}: {e}")
-            else:
-                session = build_session_for_url(site_url, cookies_text)
-                if session.cookies:
-                    logs.append(f"🔐 Loaded {len(session.cookies)} cookies for {urlparse(normalize_url(site_url)).netloc}")
-                depth_label = {1: "", 2: " (deep)", 3: " (very deep)"}[effective_depth]
-                logs.append(f"🕷️ Crawling {site_url}{depth_label}...")
                 yield "\n".join(logs), kw_display, "", no_update
+                continue
 
-                # Log callback for deep crawl progress
-                def _log_update(msg, _logs=logs, _kw=kw_display):
-                    _logs.append(msg)
+            # Rebuild session every attempt so cookies are re-read from Chrome
+            # (user may have logged in / passed human-check between attempts).
+            session = build_session_for_url(site_url, cookies_text)
+            if session.cookies:
+                logs.append(f"🔐 Loaded {len(session.cookies)} cookies for {urlparse(normalize_url(site_url)).netloc}")
+            depth_label = {1: "", 2: " (deep)", 3: " (very deep)"}[effective_depth]
+            logs.append(f"🕷️ Crawling {site_url}{depth_label}{retry_label}...")
+            yield "\n".join(logs), kw_display, "", no_update
 
-                try:
-                    if effective_depth >= 2:
-                        site_links = crawl_site_deep(
-                            site_url, keywords, session=session,
-                            max_links=150, max_sub_pages=10,
-                            max_depth=effective_depth,
-                            log_fn=_log_update,
-                        )
-                    else:
-                        site_links = crawl_site_links(site_url, session=session, max_links=80)
-                    logs.append(f"  📄 Found {len(site_links)} links from {urlparse(normalize_url(site_url)).netloc}")
-                    all_links.extend(site_links)
-                except Exception as e:
+            try:
+                if effective_depth >= 2:
+                    site_links = crawl_site_deep(
+                        site_url, keywords, session=session,
+                        max_links=150, max_sub_pages=10,
+                        max_depth=effective_depth,
+                        log_fn=_log_update,
+                    )
+                else:
+                    site_links = crawl_site_links(site_url, session=session, max_links=80)
+                logs.append(f"  📄 Found {len(site_links)} links from {urlparse(normalize_url(site_url)).netloc}")
+                all_links.extend(site_links)
+            except Exception as e:
+                next_attempt = attempts + 1
+                if next_attempt < MAX_ATTEMPTS:
                     logs.append(f"  ⚠️ Failed: {e}")
+                    logs.append(f"  🔁 Queued for retry after other sites (open {site_domain} in Chrome to refresh cookies if needed)")
+                    queue.append((site_url, next_attempt))
+                else:
+                    logs.append(f"  ⚠️ Failed (final): {e}")
                     _research_issues.append(f"Crawl {urlparse(normalize_url(site_url)).netloc}: {e}")
 
             yield "\n".join(logs), kw_display, "", no_update
