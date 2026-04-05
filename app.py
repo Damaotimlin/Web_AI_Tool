@@ -166,6 +166,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 SAVED_SITES_FILE = os.path.join(os.path.dirname(__file__), ".saved_sites.json")
 SITES_HISTORY_FILE = os.path.join(os.path.dirname(__file__), ".sites_history.json")
 SAVED_PREFS_FILE = os.path.join(os.path.dirname(__file__), ".saved_prefs.json")
+SAVED_PROMPTS_FILE = os.path.join(os.path.dirname(__file__), ".saved_prompts.json")
 
 DEFAULT_PREFS = {
     "max_articles": 30,
@@ -224,6 +225,21 @@ def save_prefs(**kwargs):
     prefs.update(kwargs)
     with open(SAVED_PREFS_FILE, "w") as f:
         json.dump(prefs, f)
+
+
+def load_saved_prompts() -> dict[str, str]:
+    """Load saved prompts from disk. Returns dict of name -> prompt text."""
+    try:
+        with open(SAVED_PROMPTS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_prompts(prompts: dict[str, str]):
+    """Save prompts dict to disk."""
+    with open(SAVED_PROMPTS_FILE, "w") as f:
+        json.dump(prompts, f, ensure_ascii=False)
 
 
 def save_sites(sites: list[str]):
@@ -776,11 +792,13 @@ def add_hyperlink(paragraph, url, text, font_size, color, slide_part=None):
 def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_image: str | None = None) -> str:
     """Build .pptx file from slide data — dual-language with source links."""
     themes = {
-        "Dark":  {"bg": RGBColor(0x1A, 0x1A, 0x2E), "title": RGBColor(0xE9, 0x4F, 0x37), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xAA, 0xAA), "link": RGBColor(0x4F, 0xC3, 0xF7)},
-        "Light": {"bg": RGBColor(0xFA, 0xFA, 0xFA), "title": RGBColor(0x22, 0x22, 0x22),  "text": RGBColor(0x33, 0x33, 0x33), "sub": RGBColor(0x77, 0x77, 0x77), "link": RGBColor(0x1A, 0x73, 0xE8)},
-        "Blue":  {"bg": RGBColor(0x0F, 0x3D, 0x66), "title": RGBColor(0x4F, 0xC3, 0xF7), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xCC, 0xDD), "link": RGBColor(0x8B, 0xD9, 0xFF)},
+        "Dark":    {"bg": RGBColor(0x1A, 0x1A, 0x2E), "title": RGBColor(0xE9, 0x4F, 0x37), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xAA, 0xAA), "link": RGBColor(0x4F, 0xC3, 0xF7)},
+        "Light":   {"bg": RGBColor(0xFA, 0xFA, 0xFA), "title": RGBColor(0x22, 0x22, 0x22),  "text": RGBColor(0x33, 0x33, 0x33), "sub": RGBColor(0x77, 0x77, 0x77), "link": RGBColor(0x1A, 0x73, 0xE8)},
+        "Blue":    {"bg": RGBColor(0x0F, 0x3D, 0x66), "title": RGBColor(0x4F, 0xC3, 0xF7), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xCC, 0xDD), "link": RGBColor(0x8B, 0xD9, 0xFF)},
+        "Picture": {"bg": RGBColor(0x0D, 0x0D, 0x0D), "title": RGBColor(0xFF, 0xFF, 0xFF), "text": RGBColor(0xF0, 0xF0, 0xF0), "sub": RGBColor(0xBB, 0xBB, 0xBB), "link": RGBColor(0x4F, 0xC3, 0xF7)},
     }
     colors = themes.get(theme, themes["Dark"])
+    is_picture_style = (theme == "Picture")
 
     prs = Presentation()
     prs.slide_width  = Inches(13.33)
@@ -835,24 +853,66 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
         sp2.font.size = Pt(18)
         sp2.font.color.rgb = colors["sub"]
 
-    # Cover image on title slide (lower right, below text)
+    # Cover image on title slide
     if cover_image and os.path.exists(cover_image):
         try:
             from PIL import Image
-            with Image.open(cover_image) as img:
-                img_w, img_h = img.size
-            aspect = img_w / img_h if img_h else 1
-            max_w, max_h = 3.5, 2.5
-            if aspect > max_w / max_h:
-                w = min(max_w, img_w / 96)
-                h = w / aspect
+            if is_picture_style:
+                # Picture style: full-bleed background image with dark overlay
+                # Add image spanning full slide, positioned behind text
+                with Image.open(cover_image) as img:
+                    img_w, img_h = img.size
+                aspect = img_w / img_h if img_h else 1
+                slide_aspect = 13.33 / 7.5
+                if aspect > slide_aspect:
+                    # Image wider than slide — fit height, crop sides
+                    h = 7.5
+                    w = h * aspect
+                else:
+                    # Image taller — fit width, crop top/bottom
+                    w = 13.33
+                    h = w / aspect
+                left = Inches((13.33 - w) / 2)
+                top = Inches((7.5 - h) / 2)
+                pic = title_slide.shapes.add_picture(cover_image, left, top, Inches(w), Inches(h))
+                # Send image to back so text stays on top
+                title_slide.shapes._spTree.remove(pic._element)
+                title_slide.shapes._spTree.insert(2, pic._element)
+                # Add semi-transparent dark overlay rectangle
+                from pptx.oxml.ns import qn
+                overlay = title_slide.shapes.add_shape(
+                    1, Inches(0), Inches(0), Inches(13.33), Inches(7.5)  # 1 = rectangle
+                )
+                overlay.fill.solid()
+                overlay.fill.fore_color.rgb = RGBColor(0x00, 0x00, 0x00)
+                # Set transparency via XML (60% transparent)
+                fill_elem = overlay.fill._fill
+                solidFill = fill_elem.find(qn('a:solidFill'))
+                if solidFill is not None:
+                    srgbClr = solidFill.find(qn('a:srgbClr'))
+                    if srgbClr is not None:
+                        alpha = srgbClr.makeelement(qn('a:alpha'), {'val': '40000'})
+                        srgbClr.append(alpha)
+                overlay.line.fill.background()
+                # Send overlay behind text but in front of image
+                title_slide.shapes._spTree.remove(overlay._element)
+                title_slide.shapes._spTree.insert(3, overlay._element)
             else:
-                h = min(max_h, img_h / 96)
-                w = h * aspect
-            # Position: bottom-right corner with padding
-            left = Inches(13.33 - w - 0.6)
-            top = Inches(7.5 - h - 0.6)
-            title_slide.shapes.add_picture(cover_image, left, top, Inches(w), Inches(h))
+                # Standard style: small image in lower-right corner
+                with Image.open(cover_image) as img:
+                    img_w, img_h = img.size
+                aspect = img_w / img_h if img_h else 1
+                max_w, max_h = 3.5, 2.5
+                if aspect > max_w / max_h:
+                    w = min(max_w, img_w / 96)
+                    h = w / aspect
+                else:
+                    h = min(max_h, img_h / 96)
+                    w = h * aspect
+                # Position: bottom-right corner with padding
+                left = Inches(13.33 - w - 0.6)
+                top = Inches(7.5 - h - 0.6)
+                title_slide.shapes.add_picture(cover_image, left, top, Inches(w), Inches(h))
         except ImportError:
             title_slide.shapes.add_picture(cover_image, Inches(9.0), Inches(4.5), Inches(3.5), Inches(2.2))
         except Exception:
@@ -873,30 +933,7 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
     # --- Summary Slide ---
     summary_text = data.get("summary", "")
     if summary_text:
-        # Split into lines first, then paginate by line count
-        all_lines = [l.strip() for l in summary_text.split("\n") if l.strip()]
-        max_lines_per_slide = 14
-        summary_pages = []
-        for i in range(0, len(all_lines), max_lines_per_slide):
-            summary_pages.append(all_lines[i:i + max_lines_per_slide])
-
-        # If only one page but too many chars, split by char count
-        if len(summary_pages) == 1 and len(summary_text) > 700:
-            summary_pages = []
-            remaining = summary_text
-            while remaining:
-                if len(remaining) <= 700:
-                    summary_pages.append(remaining.split("\n"))
-                    break
-                cut = remaining.rfind("。", 0, 700)
-                if cut < 0:
-                    cut = remaining.rfind(". ", 0, 700)
-                if cut < 0:
-                    cut = remaining.rfind("\n", 0, 700)
-                if cut < 0:
-                    cut = 700
-                summary_pages.append([l.strip() for l in remaining[:cut + 1].split("\n") if l.strip()])
-                remaining = remaining[cut + 1:].strip()
+        summary_pages = _paginate_summary_lines(summary_text)
 
         for pg_idx, pg_lines in enumerate(summary_pages):
             sum_slide = prs.slides.add_slide(prs.slide_layouts[6])
@@ -1051,6 +1088,207 @@ def build_pptx(data: dict, theme: str, issues: list[str] | None = None, cover_im
     path = os.path.join(OUTPUT_DIR, f"{filename}.pptx")
     prs.save(path)
     return path
+
+
+def _paginate_summary_lines(summary_text: str,
+                            max_visual_lines: int = 19,
+                            chars_per_visual_line: int = 115) -> list[list[str]]:
+    """Split summary text into pages that fit a fixed-size text box.
+
+    Estimates visual line count per logical line, weighting CJK chars ~2×
+    (since they're roughly twice as wide as Latin chars at the same point
+    size). If a single logical line would overflow a whole page, it is
+    further broken at a sentence boundary (。/. /, / space / hard cut).
+    """
+    import math
+
+    def _is_cjk(ch: str) -> bool:
+        o = ord(ch)
+        return (0x3000 <= o <= 0x9FFF) or (0xFF00 <= o <= 0xFFEF) or (0x4E00 <= o <= 0x9FFF)
+
+    def _weight(s: str) -> float:
+        w = 0.0
+        for ch in s:
+            w += 2.0 if _is_cjk(ch) else 1.0
+        return w
+
+    def _visual_lines(s: str) -> int:
+        if not s:
+            return 1
+        return max(1, math.ceil(_weight(s) / chars_per_visual_line))
+
+    def _break_long_line(s: str, budget: int) -> list[str]:
+        """Break a line too big for one page into chunks of ≤ budget visual lines."""
+        # leave a one-line safety margin so rounding never overflows the page
+        max_weight = max(1, (budget - 1)) * chars_per_visual_line
+        chunks = []
+        remaining = s
+        while _visual_lines(remaining) > budget:
+            # Walk forward accumulating weight until we hit max_weight, then
+            # back off to the nearest sentence / punctuation / space boundary.
+            acc = 0.0
+            cut = 0
+            for i, ch in enumerate(remaining):
+                acc += 2.0 if _is_cjk(ch) else 1.0
+                if acc >= max_weight:
+                    cut = i + 1
+                    break
+            if cut <= 0:
+                cut = len(remaining)
+            # prefer a boundary in the last ~20% of the chunk
+            lo = max(1, int(cut * 0.8))
+            boundary = -1
+            for marker in ("。", "！", "？", ". ", "! ", "? ", "; ", ", ", "，", "、", " ", "\n"):
+                b = remaining.rfind(marker, lo, cut)
+                if b > boundary:
+                    boundary = b + len(marker)
+            if boundary <= 0:
+                boundary = cut
+            chunks.append(remaining[:boundary].rstrip())
+            remaining = remaining[boundary:].lstrip()
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    raw_lines = [l.strip() for l in summary_text.split("\n") if l.strip()]
+
+    # Pre-break any line that is by itself too tall for a page.
+    expanded: list[str] = []
+    for line in raw_lines:
+        if _visual_lines(line) > max_visual_lines:
+            expanded.extend(_break_long_line(line, max_visual_lines))
+        else:
+            expanded.append(line)
+
+    # Pack lines into pages under the visual-line budget.
+    pages: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for line in expanded:
+        needed = _visual_lines(line)
+        if current and used + needed > max_visual_lines:
+            pages.append(current)
+            current = []
+            used = 0
+        current.append(line)
+        used += needed
+    if current:
+        pages.append(current)
+    return pages or [[""]]
+
+
+def build_summary_pptx(summary_text: str, lang: str, urls: list[str] | None = None, theme: str = "Dark") -> str:
+    """Build a clean summary-only PPTX from translated text. Returns the pptx path."""
+    themes = {
+        "Dark":    {"bg": RGBColor(0x1A, 0x1A, 0x2E), "title": RGBColor(0xE9, 0x4F, 0x37), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xAA, 0xAA), "link": RGBColor(0x4F, 0xC3, 0xF7)},
+        "Light":   {"bg": RGBColor(0xFA, 0xFA, 0xFA), "title": RGBColor(0x22, 0x22, 0x22),  "text": RGBColor(0x33, 0x33, 0x33), "sub": RGBColor(0x77, 0x77, 0x77), "link": RGBColor(0x1A, 0x73, 0xE8)},
+        "Blue":    {"bg": RGBColor(0x0F, 0x3D, 0x66), "title": RGBColor(0x4F, 0xC3, 0xF7), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xCC, 0xDD), "link": RGBColor(0x8B, 0xD9, 0xFF)},
+        "Picture": {"bg": RGBColor(0x1A, 0x1A, 0x2E), "title": RGBColor(0xE9, 0x4F, 0x37), "text": RGBColor(0xFF, 0xFF, 0xFF), "sub": RGBColor(0xAA, 0xAA, 0xAA), "link": RGBColor(0x4F, 0xC3, 0xF7)},
+    }
+    colors = themes.get(theme, themes["Dark"])
+
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+
+    def set_bg(slide, color):
+        bg = slide.background
+        fill = bg.fill
+        fill.solid()
+        fill.fore_color.rgb = color
+
+    # --- Title Slide ---
+    title_slide = prs.slides.add_slide(prs.slide_layouts[6])
+    set_bg(title_slide, colors["bg"])
+
+    txBox = title_slide.shapes.add_textbox(Inches(1.5), Inches(2.5), Inches(10), Inches(1.2))
+    tf = txBox.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = f"Summary — {lang}"
+    p.font.size = Pt(44)
+    p.font.bold = True
+    p.font.color.rgb = colors["title"]
+
+    subBox = title_slide.shapes.add_textbox(Inches(1.5), Inches(4.0), Inches(10), Inches(1))
+    stf = subBox.text_frame
+    stf.word_wrap = True
+    sp = stf.paragraphs[0]
+    sp.text = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sp.font.size = Pt(20)
+    sp.font.color.rgb = colors["sub"]
+
+    # Source URLs on title slide
+    if urls:
+        srcBox = title_slide.shapes.add_textbox(Inches(1.5), Inches(5.0), Inches(10), Inches(2.0))
+        srctf = srcBox.text_frame
+        srctf.word_wrap = True
+        for si, src_url in enumerate(urls):
+            src_domain = urlparse(normalize_url(src_url)).netloc
+            sp = srctf.paragraphs[0] if si == 0 else srctf.add_paragraph()
+            add_hyperlink(sp, src_url, f"📎 {src_domain}", Pt(11), colors["link"], slide_part=title_slide.part)
+            sp.space_after = Pt(2)
+
+    # --- Summary Slides (paginated by estimated visual line count) ---
+    summary_pages = _paginate_summary_lines(summary_text)
+
+    for pg_idx, pg_lines in enumerate(summary_pages):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        set_bg(slide, colors["bg"])
+
+        stitle = "Summary"
+        if len(summary_pages) > 1:
+            stitle += f" ({pg_idx + 1}/{len(summary_pages)})"
+        shBox = slide.shapes.add_textbox(Inches(0.8), Inches(0.3), Inches(11.5), Inches(0.7))
+        shtf = shBox.text_frame
+        shp = shtf.paragraphs[0]
+        shp.text = stitle
+        shp.font.size = Pt(28)
+        shp.font.bold = True
+        shp.font.color.rgb = colors["title"]
+
+        sbBox = slide.shapes.add_textbox(Inches(0.8), Inches(1.1), Inches(11.5), Inches(6.0))
+        sbtf = sbBox.text_frame
+        sbtf.word_wrap = True
+        first = True
+        for line in pg_lines:
+            if not line:
+                continue
+            sp = sbtf.paragraphs[0] if first else sbtf.add_paragraph()
+            first = False
+            sp.text = line
+            sp.font.size = Pt(14)
+            sp.font.color.rgb = colors["text"]
+            sp.space_after = Pt(3)
+
+    # Save
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"summary_{lang}_{timestamp}"
+    path = os.path.join(OUTPUT_DIR, f"{filename}.pptx")
+    prs.save(path)
+    return path
+
+
+def export_summary_pdf(pptx_path: str) -> str | None:
+    """Convert a summary PPTX to PDF via LibreOffice. Returns PDF path or None."""
+    pdf_path = pptx_path.replace(".pptx", ".pdf")
+    soffice_paths = [
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "soffice",
+        "libreoffice",
+    ]
+    for soffice in soffice_paths:
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf",
+                 "--outdir", os.path.dirname(pptx_path), pptx_path],
+                timeout=120, check=True, capture_output=True,
+            )
+            if os.path.exists(pdf_path):
+                return pdf_path
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    return None
 
 
 def extract_keywords(prompt: str, model: str = "") -> list[str]:
@@ -1451,11 +1689,14 @@ def _is_section_page(url: str, base_domain: str) -> bool:
     parts = [p for p in path.split("/") if p]
     if len(parts) > 3 or len(parts) < 1:
         return False
+    # Reject article-looking URLs first (long slug / date path / numeric id)
+    if _ARTICLE_PATTERNS.search(path):
+        return False
     # Match section patterns
     if _SECTION_PATTERNS.search(path):
         return True
     # Short path with 1-2 segments that don't look like articles
-    if len(parts) <= 2 and not _ARTICLE_PATTERNS.search(path):
+    if len(parts) <= 2:
         return True
     return False
 
@@ -1495,11 +1736,17 @@ def _extract_links_from_html(html: str, base_url: str, seen: set, max_links: int
 
 
 def crawl_site_deep(base_url: str, keywords: list[str], session: requests.Session | None = None,
-                    max_links: int = 150, max_sub_pages: int = 10, log_fn=None) -> list[dict]:
-    """Depth-2 crawl: crawl main page, then selectively follow section/category pages.
+                    max_links: int = 150, max_sub_pages: int = 10, max_depth: int = 2,
+                    log_fn=None) -> list[dict]:
+    """Recursive crawl: main page → section pages → (optional) sub-section pages.
 
-    Only follows pages that match section patterns or contain keywords in their URL/text.
-    Caps sub-page crawls to max_sub_pages to keep resource usage bounded.
+    max_depth controls how many levels of section pages to follow:
+      1 = main page only (same as crawl_site_links)
+      2 = main page + section pages (e.g. wsj.com → /economy)
+      3 = main page + section + sub-section (e.g. wsj.com → /economy → /economy/jobs)
+
+    Per-level fan-out halves each level to bound total fetches. A visited-URL
+    set prevents cycles. Section pages containing keywords are prioritized.
     """
     base_url = normalize_url(base_url)
     parsed = urlparse(base_url)
@@ -1513,72 +1760,94 @@ def crawl_site_deep(base_url: str, keywords: list[str], session: requests.Sessio
         if fresh.cookies:
             s.cookies.update(fresh.cookies)
 
-    # Depth 1: crawl main page
-    try:
-        res = s.get(base_url, timeout=15)
-        res.raise_for_status()
-        main_html = res.text
-    except Exception:
-        # Try browser fallback
-        try:
-            main_html = _browser_fetch_html(base_url)
-        except Exception:
-            # Fall back to regular crawl (RSS etc)
-            return crawl_site_links(base_url, session=session, max_links=max_links)
-
-    seen = set()
-    all_links = _extract_links_from_html(main_html, base_url, seen, max_links)
-
-    if log_fn:
-        log_fn(f"    📄 Depth 1: {len(all_links)} links")
-
-    # Identify section pages to follow
-    soup = BeautifulSoup(main_html, "lxml")
-    section_urls = []
     kw_lower = [k.lower() for k in keywords] if keywords else []
+    seen: set[str] = set()          # canonical article URLs already collected
+    visited: set[str] = set()       # pages already fetched (dedup crawl targets)
+    all_links: list[dict] = []
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        full_url = urljoin(base_url, href)
-        canon = f"{urlparse(full_url).scheme}://{urlparse(full_url).netloc}{urlparse(full_url).path}"
-
-        if canon == base_url.rstrip("/") or canon in seen:
-            continue
-
-        if _is_section_page(full_url, domain):
-            # Prioritize sections that match keywords
-            link_text = (a.get_text(strip=True) + " " + urlparse(full_url).path).lower()
-            keyword_match = any(kw in link_text for kw in kw_lower) if kw_lower else False
-            section_urls.append((full_url, keyword_match))
-
-    # Sort: keyword-matching sections first, then others
-    section_urls.sort(key=lambda x: (not x[1], x[0]))
-    section_urls = [url for url, _ in section_urls[:max_sub_pages]]
-
-    if log_fn and section_urls:
-        log_fn(f"    🔍 Depth 2: following {len(section_urls)} section pages...")
-
-    # Depth 2: crawl selected section pages
-    for sub_url in section_urls:
-        if len(all_links) >= max_links:
-            break
+    def _fetch_html(url: str) -> str | None:
         try:
-            res = s.get(sub_url, timeout=15)
+            res = s.get(url, timeout=15)
             res.raise_for_status()
-            sub_html = res.text
+            return res.text
         except Exception:
             try:
-                sub_html = _browser_fetch_html(sub_url)
+                return _browser_fetch_html(url)
             except Exception:
+                return None
+
+    def _find_section_pages(html: str, from_url: str) -> list[str]:
+        """Return section URLs from this page, keyword-matches first."""
+        soup = BeautifulSoup(html, "lxml")
+        candidates: list[tuple[str, bool]] = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            full_url = urljoin(from_url, href)
+            p = urlparse(full_url)
+            canon = f"{p.scheme}://{p.netloc}{p.path}"
+            canon_key = canon.rstrip("/")
+            if (canon_key == base_url.rstrip("/")
+                    or canon in seen
+                    or canon_key in visited):
                 continue
+            if not _is_section_page(full_url, domain):
+                continue
+            link_text = (a.get_text(strip=True) + " " + p.path).lower()
+            keyword_match = any(kw in link_text for kw in kw_lower) if kw_lower else False
+            candidates.append((full_url, keyword_match))
+        candidates.sort(key=lambda x: (not x[1], x[0]))
+        # dedup while preserving order
+        out, seen_urls = [], set()
+        for url, _ in candidates:
+            k = url.rstrip("/")
+            if k in seen_urls:
+                continue
+            seen_urls.add(k)
+            out.append(url)
+        return out
+
+    def _crawl(url: str, current_depth: int, fanout_budget: int) -> None:
+        if len(all_links) >= max_links:
+            return
+        canon_key = url.rstrip("/")
+        if canon_key in visited:
+            return
+        visited.add(canon_key)
+
+        html = _fetch_html(url)
+        if not html:
+            return
 
         remaining = max_links - len(all_links)
-        new_links = _extract_links_from_html(sub_html, sub_url, seen, remaining)
+        new_links = _extract_links_from_html(html, url, seen, remaining)
         all_links.extend(new_links)
 
-        if log_fn and new_links:
-            section_name = urlparse(sub_url).path.rstrip("/").split("/")[-1] or "index"
-            log_fn(f"    📄 /{section_name}: +{len(new_links)} links")
+        if log_fn:
+            if current_depth == 1:
+                log_fn(f"    📄 Depth 1: {len(new_links)} links")
+            else:
+                section_name = urlparse(url).path.rstrip("/").split("/")[-1] or "index"
+                log_fn(f"    📄 depth-{current_depth} /{section_name}: +{len(new_links)} links")
+
+        if current_depth >= max_depth:
+            return
+
+        sub_urls = _find_section_pages(html, url)[:fanout_budget]
+        if log_fn and sub_urls:
+            log_fn(f"    🔍 Depth {current_depth + 1}: following {len(sub_urls)} pages...")
+
+        # halve fan-out at each deeper level to bound total fetches
+        next_budget = max(2, fanout_budget // 2)
+        for sub_url in sub_urls:
+            if len(all_links) >= max_links:
+                break
+            _crawl(sub_url, current_depth + 1, next_budget)
+
+    _crawl(base_url, 1, max_sub_pages)
+
+    # If the root fetch failed outright, fall back to the simple crawler
+    if not all_links and len(visited) <= 1:
+        return crawl_site_links(base_url, session=session, max_links=max_links)
 
     return all_links
 
@@ -1737,7 +2006,7 @@ def expand_prompt_vars(text: str) -> str:
     return _PROMPT_VAR_PATTERN.sub(lambda m: mapping[m.group(1)], text)
 
 
-def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_deep=False, stop_flag=None):
+def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_deep=False, crawl_depth=None, stop_flag=None):
     """Research pipeline: keywords → crawl multiple sites → AI filters titles → deep scan."""
     global _research_issues
     _research_issues = []
@@ -1745,6 +2014,13 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
     no_update = gr.update()
     if stop_flag is None:
         stop_flag = StopFlag()  # no-op flag if none provided
+
+    # Resolve effective crawl depth (1=standard, 2=deep, 3=very-deep).
+    # crawl_depth takes precedence; else fall back to legacy crawl_deep bool.
+    if crawl_depth is None:
+        effective_depth = 2 if crawl_deep else 1
+    else:
+        effective_depth = max(1, min(3, int(crawl_depth)))
 
     # Normalize site_urls to a list
     if isinstance(site_urls, str):
@@ -1804,7 +2080,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
                 session = build_session_for_url(site_url, cookies_text)
                 if session.cookies:
                     logs.append(f"🔐 Loaded {len(session.cookies)} cookies for {urlparse(normalize_url(site_url)).netloc}")
-                depth_label = " (deep)" if crawl_deep else ""
+                depth_label = {1: "", 2: " (deep)", 3: " (very deep)"}[effective_depth]
                 logs.append(f"🕷️ Crawling {site_url}{depth_label}...")
                 yield "\n".join(logs), kw_display, "", no_update
 
@@ -1813,10 +2089,11 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
                     _logs.append(msg)
 
                 try:
-                    if crawl_deep:
+                    if effective_depth >= 2:
                         site_links = crawl_site_deep(
                             site_url, keywords, session=session,
                             max_links=150, max_sub_pages=10,
+                            max_depth=effective_depth,
                             log_fn=_log_update,
                         )
                     else:
@@ -3040,21 +3317,47 @@ with gr.Blocks(title="Web AI Tool") as app:
         )
         cookie_status = gr.HTML('<p style="font-size:10px;color:#666;margin:2px 0 0;">Loads cookies for the domain in Site URL above.</p>')
 
+    # ── Saved Prompts Management ──
+    _saved_prompts_init = load_saved_prompts()
+    with gr.Accordion("💾 Saved Prompts", open=False, elem_classes=["ext-accordion"]):
+        prompt_mgr_dropdown = gr.Dropdown(
+            choices=list(_saved_prompts_init.keys()),
+            label="Saved Prompts",
+            interactive=True,
+            allow_custom_value=False,
+        )
+        prompt_mgr_name = gr.Textbox(label="Name", placeholder="Enter a name for this prompt", lines=1)
+        prompt_mgr_text = gr.Textbox(label="Prompt Text", placeholder="Enter prompt text", lines=3)
+        with gr.Row():
+            prompt_mgr_save = gr.Button("Save", variant="primary", scale=1)
+            prompt_mgr_update = gr.Button("Update", variant="secondary", scale=1)
+            prompt_mgr_delete = gr.Button("Delete", variant="stop", scale=1)
+        prompt_mgr_status = gr.HTML("")
+
     with gr.Tabs(elem_classes=["ext-tabs"]):
 
         # ── Research Tab ──
         with gr.TabItem("🔍 Research"):
             with gr.Row():
                 with gr.Column(scale=1):
-                    research_prompt = gr.Textbox(
-                        label="Topic / Prompt",
-                        placeholder="e.g. Impact of AI regulation on tech companies",
-                        info="Variables: $today $now $weekday $year $month $day (auto-expanded at runtime)",
-                        lines=3,
-                    )
+                    with gr.Row():
+                        research_prompt = gr.Textbox(
+                            label="Topic / Prompt",
+                            placeholder="e.g. Impact of AI regulation on tech companies",
+                            info="Variables: $today $now $weekday $year $month $day (auto-expanded at runtime)",
+                            lines=3,
+                            scale=4,
+                        )
+                        research_prompt_picker = gr.Dropdown(
+                            choices=list(_saved_prompts_init.keys()),
+                            label="Load Saved Prompt",
+                            interactive=True,
+                            allow_custom_value=False,
+                            scale=2,
+                        )
                     with gr.Row():
                         research_max = gr.Number(value=prefs["max_articles"], label="Articles to deep-scan", precision=0, minimum=1, scale=2)
-                        crawl_depth = gr.Radio(["Standard", "Deep"], value=prefs.get("crawl_depth", "Standard"), label="Crawl Depth", scale=2)
+                        crawl_depth = gr.Radio(["Standard", "Deep", "Very Deep"], value=prefs.get("crawl_depth", "Standard"), label="Crawl Depth", scale=2)
                     auto_keynote = gr.Checkbox(value=prefs["auto_keynote"], label="Auto-generate Keynote from top result")
                     with gr.Row():
                         research_btn = gr.Button("Search Articles", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
@@ -3069,7 +3372,7 @@ with gr.Blocks(title="Web AI Tool") as app:
                 pick_lang1  = gr.Dropdown(["zh-TW", "English", "Japanese", "Korean", "Spanish", "French", "German"], value=prefs["lang1"], label="Primary Lang", scale=2)
                 pick_lang2  = gr.Dropdown(["English", "zh-TW", "Japanese", "Korean", "Spanish", "French", "German", "None"], value=prefs["lang2"], label="Secondary Lang", scale=2)
                 pick_slides = gr.Number(value=prefs["slides"], label="Slides", precision=0, minimum=1, scale=1)
-                pick_theme  = gr.Radio(["Dark", "Light", "Blue"], value=prefs["theme"], label="Theme", scale=2)
+                pick_theme  = gr.Radio(["Dark", "Light", "Blue", "Picture"], value=prefs["theme"], label="Theme", scale=2)
             with gr.Row():
                 generate_from_research = gr.Button("Generate Keynote from Article", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
                 pick_stop = gr.Button("Stop", variant="stop", interactive=False, scale=1)
@@ -3087,7 +3390,7 @@ with gr.Blocks(title="Web AI Tool") as app:
                         lang2      = gr.Dropdown(["English", "zh-TW", "Japanese", "Korean", "Spanish", "French", "German", "None"], value=prefs["lang2"], label="Secondary Lang", scale=2)
                         num_slides = gr.Number(value=prefs["slides"], label="Slides", precision=0, minimum=1, scale=1)
                     with gr.Row():
-                        theme        = gr.Radio(["Dark", "Light", "Blue"], value=prefs["theme"], label="Theme", scale=2)
+                        theme        = gr.Radio(["Dark", "Light", "Blue", "Picture"], value=prefs["theme"], label="Theme", scale=2)
                         open_keynote = gr.Checkbox(value=True, label="Auto-open file", scale=1)
                     with gr.Row():
                         btn = gr.Button("Generate Keynote", variant="primary", elem_classes=["ext-generate-btn"], scale=3)
@@ -3116,6 +3419,49 @@ with gr.Blocks(title="Web AI Tool") as app:
             output_confirm_btn = gr.Button("⚠️ Confirm Delete", variant="stop", scale=1)
             output_cancel_btn = gr.Button("Cancel", scale=1)
         output_download = gr.File(label="Download", visible=False)
+
+    # ── Quick Translate & Summarize ──
+    gr.HTML('<div class="ext-section"></div>')
+    gr.HTML('<h3 style="margin:0.5em 0 0.2em 0;">📝 Quick Translate & Summarize</h3>')
+    with gr.Row():
+        with gr.Column(scale=1):
+            qt_urls = gr.Textbox(
+                label="Article URLs (one per line)",
+                placeholder="https://example.com/article1\nhttps://example.com/article2",
+                lines=3,
+            )
+            with gr.Row():
+                qt_prompt = gr.Textbox(
+                    label="Focus prompt (optional)",
+                    placeholder="e.g. Focus on financial impact and key numbers",
+                    info="Variables: $today $now $weekday $year $month $day (auto-expanded at runtime)",
+                    lines=2,
+                    scale=4,
+                )
+                qt_prompt_picker = gr.Dropdown(
+                    choices=list(_saved_prompts_init.keys()),
+                    label="Load Saved Prompt",
+                    interactive=True,
+                    allow_custom_value=False,
+                    scale=2,
+                )
+            with gr.Row():
+                qt_lang = gr.Dropdown(
+                    ["zh-TW", "English", "Japanese", "Korean", "Spanish", "French", "German"],
+                    value=prefs["lang1"], label="Language", scale=2,
+                )
+                qt_lang2 = gr.Dropdown(
+                    ["None", "English", "zh-TW", "Japanese", "Korean", "Spanish", "French", "German"],
+                    value="None", label="Secondary Language", scale=2,
+                )
+            with gr.Row():
+                qt_export_pdf = gr.Checkbox(value=True, label="Export PDF", scale=1)
+                qt_theme = gr.Radio(["Dark", "Light", "Blue"], value="Dark", label="PDF Theme", scale=3)
+            qt_btn = gr.Button("Translate & Summarize", variant="primary", elem_classes=["ext-generate-btn"])
+        with gr.Column(scale=1):
+            qt_log = gr.Textbox(label="Progress", lines=3, interactive=False, elem_classes=["ext-progress"])
+            qt_output = gr.Textbox(label="Result", lines=12, interactive=False, elem_classes=["ext-summary"])
+            qt_file = gr.File(label="Download", visible=False)
 
     # ── Live sync timer — polls shared progress so all clients stay updated ──
     sync_timer = gr.Timer(2)  # poll every 2 seconds
@@ -3150,6 +3496,106 @@ with gr.Blocks(title="Web AI Tool") as app:
 
     # ── Model auto-refresh timer (bound after handlers defined) ──
     model_timer = gr.Timer(30)
+
+    # ── Saved Prompts event handlers ──
+    def _prompt_mgr_all_dropdowns(prompts_dict):
+        """Return update dicts for all prompt-related dropdowns."""
+        names = list(prompts_dict.keys())
+        return (
+            gr.update(choices=names, value=None),   # prompt_mgr_dropdown
+            gr.update(choices=names, value=None),   # research_prompt_picker
+            gr.update(choices=names, value=None),   # qt_prompt_picker
+        )
+
+    def on_prompt_mgr_select(name):
+        """Load selected prompt into the manager fields."""
+        if not name:
+            return "", ""
+        prompts = load_saved_prompts()
+        return name, prompts.get(name, "")
+
+    def on_prompt_mgr_save(name, text):
+        """Save a new prompt."""
+        name = (name or "").strip()
+        text = (text or "").strip()
+        if not name:
+            return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                    '<p style="color:red;font-size:12px;">Name is required.</p>')
+        if not text:
+            return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                    '<p style="color:red;font-size:12px;">Prompt text is required.</p>')
+        prompts = load_saved_prompts()
+        if name in prompts:
+            return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                    f'<p style="color:orange;font-size:12px;">"{name}" already exists. Use Update to overwrite.</p>')
+        prompts[name] = text
+        save_prompts(prompts)
+        mgr, res, qt = _prompt_mgr_all_dropdowns(prompts)
+        return mgr, res, qt, "", "", f'<p style="color:green;font-size:12px;">Saved "{name}".</p>'
+
+    def on_prompt_mgr_update(name, text):
+        """Update an existing prompt."""
+        name = (name or "").strip()
+        text = (text or "").strip()
+        if not name:
+            return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                    '<p style="color:red;font-size:12px;">Name is required.</p>')
+        prompts = load_saved_prompts()
+        if name not in prompts:
+            return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
+                    f'<p style="color:red;font-size:12px;">"{name}" not found. Use Save for new prompts.</p>')
+        prompts[name] = text
+        save_prompts(prompts)
+        mgr, res, qt = _prompt_mgr_all_dropdowns(prompts)
+        return mgr, res, qt, gr.update(), gr.update(), f'<p style="color:green;font-size:12px;">Updated "{name}".</p>'
+
+    def on_prompt_mgr_delete(name):
+        """Delete a saved prompt."""
+        name = (name or "").strip()
+        if not name:
+            return (gr.update(), gr.update(), gr.update(), "", "",
+                    '<p style="color:red;font-size:12px;">Select a prompt to delete.</p>')
+        prompts = load_saved_prompts()
+        if name in prompts:
+            del prompts[name]
+            save_prompts(prompts)
+        mgr, res, qt = _prompt_mgr_all_dropdowns(prompts)
+        return mgr, res, qt, "", "", f'<p style="color:green;font-size:12px;">Deleted "{name}".</p>'
+
+    def on_prompt_picker_load(name):
+        """Load a saved prompt into the target textbox."""
+        if not name:
+            return gr.update()
+        prompts = load_saved_prompts()
+        return prompts.get(name, "")
+
+    prompt_mgr_dropdown.change(
+        on_prompt_mgr_select, inputs=[prompt_mgr_dropdown],
+        outputs=[prompt_mgr_name, prompt_mgr_text],
+    )
+    prompt_mgr_save.click(
+        on_prompt_mgr_save, inputs=[prompt_mgr_name, prompt_mgr_text],
+        outputs=[prompt_mgr_dropdown, research_prompt_picker, qt_prompt_picker,
+                 prompt_mgr_name, prompt_mgr_text, prompt_mgr_status],
+    )
+    prompt_mgr_update.click(
+        on_prompt_mgr_update, inputs=[prompt_mgr_name, prompt_mgr_text],
+        outputs=[prompt_mgr_dropdown, research_prompt_picker, qt_prompt_picker,
+                 prompt_mgr_name, prompt_mgr_text, prompt_mgr_status],
+    )
+    prompt_mgr_delete.click(
+        on_prompt_mgr_delete, inputs=[prompt_mgr_dropdown],
+        outputs=[prompt_mgr_dropdown, research_prompt_picker, qt_prompt_picker,
+                 prompt_mgr_name, prompt_mgr_text, prompt_mgr_status],
+    )
+    research_prompt_picker.change(
+        on_prompt_picker_load, inputs=[research_prompt_picker],
+        outputs=[research_prompt],
+    )
+    qt_prompt_picker.change(
+        on_prompt_picker_load, inputs=[qt_prompt_picker],
+        outputs=[qt_prompt],
+    )
 
     # ── Event handlers ──
     def on_provider_change(provider_name):
@@ -3350,11 +3796,11 @@ with gr.Blocks(title="Web AI Tool") as app:
                       outputs=[site_category, cat_edit_select, cat_edit_sites, research_site, cat_status])
     cat_save_btn.click(on_cat_save, inputs=[cat_edit_select, cat_edit_sites], outputs=[research_site, cat_status])
 
-    def _research_worker(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, is_deep, sf):
+    def _research_worker(prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, depth_int, sf):
         """Background thread: runs research + optional keynote. Updates _progress throughout."""
         global _active_stop_flag
         try:
-            for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_deep=is_deep, stop_flag=sf):
+            for res_log, res_kw, res_out, picker_update in run_research(prompt, site_url, int(max_articles), model, cookies, crawl_depth=depth_int, stop_flag=sf):
                 if sf.stopped:
                     break
                 _progress.update(research_log=res_log, research_kw=res_kw, research_out=res_out)
@@ -3428,12 +3874,12 @@ with gr.Blocks(title="Web AI Tool") as app:
         _active_stop_flag = sf
         _progress.clear("research")
 
-        is_deep = depth == "Deep"
+        depth_int = {"Standard": 1, "Deep": 2, "Very Deep": 3}.get(depth, 1)
         save_prefs(max_articles=int(max_articles or 30), auto_keynote=bool(auto_gen),
                    slides=int(slides or 10), lang1=l1, lang2=l2, theme=thm, crawl_depth=depth)
 
         thread = threading.Thread(target=_research_worker, args=(
-            prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, is_deep, sf,
+            prompt, site_url, max_articles, model, cookies, auto_gen, l1, l2, slides, thm, depth_int, sf,
         ), daemon=True)
         thread.start()
 
@@ -3673,6 +4119,85 @@ with gr.Blocks(title="Web AI Tool") as app:
     research_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
     pick_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
     keynote_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
+
+    # ── Quick Translate handler ──
+    def run_quick_translate(urls_text, prompt, lang, lang2, mdl, export_pdf, pdf_theme):
+        """Fetch URLs, translate, summarize, and optionally export PDF."""
+        urls = [u.strip() for u in urls_text.strip().splitlines() if u.strip()]
+        if not urls:
+            yield "❌ No URLs provided", "", gr.update(visible=False, value=None)
+            return
+
+        prompt = expand_prompt_vars(prompt)
+
+        available = get_available_models()
+        ref_model = pick_stage_model("refinement", available, mdl)
+
+        logs = [f"🤖 Model: {ref_model.split('/')[-1]}"]
+        all_content = []
+
+        for i, url in enumerate(urls):
+            logs.append(f"📥 Fetching [{i+1}/{len(urls)}] {url[:60]}...")
+            yield "\n".join(logs), "", gr.update()
+            try:
+                text = fetch_url(normalize_url(url))
+                logs.append(f"  ✅ {len(text)} characters")
+                all_content.append(text)
+            except Exception as e:
+                logs.append(f"  ⚠️ Failed: {e}")
+            yield "\n".join(logs), "", gr.update()
+
+        if not all_content:
+            logs.append("❌ No content fetched")
+            yield "\n".join(logs), "", gr.update(visible=False, value=None)
+            return
+
+        content = "\n\n---\n\n".join(all_content)
+        l2 = lang2 if lang2 and lang2 != "None" else ""
+        logs.append(f"🌐 Translating to {lang}" + (f" + {l2}" if l2 else "") + "...")
+        yield "\n".join(logs), "", gr.update()
+
+        try:
+            result = translate_content(content, lang, ref_model, user_prompt=prompt, lang2=l2)
+            logs.append("✅ Translation done")
+            yield "\n".join(logs), result, gr.update()
+        except Exception as e:
+            logs.append(f"❌ Translation error: {e}")
+            yield "\n".join(logs), "", gr.update(visible=False, value=None)
+            return
+
+        # Export PDF if requested
+        if export_pdf and result:
+            logs.append("📄 Building summary PDF...")
+            yield "\n".join(logs), result, gr.update()
+            try:
+                pptx_path = build_summary_pptx(result, lang, urls=urls, theme=pdf_theme)
+                pdf_path = export_summary_pdf(pptx_path)
+                download_files = []
+                if pdf_path:
+                    logs.append(f"✅ PDF: {os.path.basename(pdf_path)}")
+                    download_files.append(pdf_path)
+                    # Remove intermediate PPTX since user asked for PDF
+                    try:
+                        os.remove(pptx_path)
+                    except OSError:
+                        pass
+                else:
+                    logs.append("⚠️ PDF export unavailable, using PPTX")
+                    download_files.append(pptx_path)
+                yield "\n".join(logs), result, gr.update(visible=True, value=download_files)
+            except Exception as e:
+                logs.append(f"⚠️ Export error: {e}")
+                yield "\n".join(logs), result, gr.update(visible=False, value=None)
+        else:
+            yield "\n".join(logs), result, gr.update(visible=False, value=None)
+
+    qt_event = qt_btn.click(
+        run_quick_translate,
+        inputs=[qt_urls, qt_prompt, qt_lang, qt_lang2, model_input, qt_export_pdf, qt_theme],
+        outputs=[qt_log, qt_output, qt_file],
+    )
+    qt_event.then(_refresh_file_list, outputs=[output_file_picker, output_status])
 
 if __name__ == "__main__":
     app.launch(
