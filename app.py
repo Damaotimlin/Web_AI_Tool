@@ -1716,6 +1716,27 @@ _research_issues = []  # Shared between research and pipeline
 _research_results = []  # Store latest results for topic grouping
 _active_stop_flag = None  # Global stop flag for the current running pipeline
 
+
+_PROMPT_VAR_PATTERN = re.compile(r"\$(today|now|date|weekday|year|month|day)\b")
+
+def expand_prompt_vars(text: str) -> str:
+    """Expand $today / $now / etc. tokens in a user prompt to current values.
+    Idempotent: once replaced, tokens are gone, so calling twice is safe."""
+    if not text or "$" not in text:
+        return text
+    now = datetime.now()
+    mapping = {
+        "today":   now.strftime("%Y-%m-%d"),
+        "date":    now.strftime("%Y-%m-%d"),
+        "now":     now.strftime("%Y-%m-%d %H:%M"),
+        "weekday": now.strftime("%A"),
+        "year":    str(now.year),
+        "month":   f"{now.month:02d}",
+        "day":     f"{now.day:02d}",
+    }
+    return _PROMPT_VAR_PATTERN.sub(lambda m: mapping[m.group(1)], text)
+
+
 def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_deep=False, stop_flag=None):
     """Research pipeline: keywords → crawl multiple sites → AI filters titles → deep scan."""
     global _research_issues
@@ -1736,6 +1757,8 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
     if not url_list:
         yield "❌ No site URLs provided", "", "", no_update
         return
+
+    prompt = expand_prompt_vars(prompt)
 
     # Save sites for future use
     save_sites(url_list)
@@ -1911,6 +1934,7 @@ def run_research(prompt, site_urls, max_articles, model, cookies_text, crawl_dee
 
 def run_pipeline(url, lang1, lang2, num_slides, theme, open_keynote, model, cookies_text, user_prompt="", extra_urls=None, stop_flag=None):
     """Generate keynote from one or more article URLs. If extra_urls provided, combines content."""
+    user_prompt = expand_prompt_vars(user_prompt)
     logs = []
     issues = list(_research_issues)  # Carry over any crawl issues
     lang2 = lang2 if lang2 and lang2 != "None" else ""
@@ -3025,6 +3049,7 @@ with gr.Blocks(title="Web AI Tool") as app:
                     research_prompt = gr.Textbox(
                         label="Topic / Prompt",
                         placeholder="e.g. Impact of AI regulation on tech companies",
+                        info="Variables: $today $now $weekday $year $month $day (auto-expanded at runtime)",
                         lines=3,
                     )
                     with gr.Row():
